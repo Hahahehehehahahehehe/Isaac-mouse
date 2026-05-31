@@ -1,0 +1,26 @@
+{
+  "path": "D:\\Labworks\\Project_mouse\\assets\\seed3d\\mouse_static.glb",
+  "vertices": 531657,
+  "faces": 999924,
+  "watertight": false,
+  "winding_consistent": true,
+  "euler_number": 2202,
+  "bounds_min": [
+    -0.5301100015640259,
+    -0.31424999237060547,
+    -1.0
+  ],
+  "bounds_max": [
+    0.5301100015640259,
+    0.31424999237060547,
+    1.0
+  ],
+  "extents_m": [
+    1.0602200031280518,
+    0.6284999847412109,
+    2.0
+  ],
+  "max_extent_m": 2.0,
+  "has_uv": true,
+  "boundary_edge_count": 58986
+}

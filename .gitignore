@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.venv-*/
+
+# Isaac Sim / local exports
+scenes/
+*.log
+
+# Large / regeneratable assets (see README)
+*.glb
+*.blend
+*.blend1
+mouse.blend
+assets/seed3d/
+mesh_textured_pbr.glb
+
+# Debug captures & test artifacts
+assets/video_frames/
+assets/_debug_frames/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Optional test USD
+assets/usd/mouse_soft_test.usd
+assets/usd/mouse_soft_prepared.blend

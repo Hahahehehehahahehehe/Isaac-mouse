@@ -1,0 +1,29 @@
+{
+  "target_body_length_m": 0.08,
+  "target_face_count": 10000,
+  "watertight": true,
+  "boundary_edges": 0,
+  "non_manifold_edges": 0,
+  "final": {
+    "name": "Mouse",
+    "vertices": 5002,
+    "faces": 10000,
+    "bounds_min": [
+      -0.021200135350227356,
+      -0.04001399502158165,
+      -0.01257882546633482
+    ],
+    "bounds_max": [
+      0.021215546876192093,
+      0.03999403864145279,
+      0.012567293830215931
+    ],
+    "extents_m": [
+      0.04241568222641945,
+      0.08000802993774414,
+      0.02514611929655075
+    ],
+    "max_extent_m": 0.08000802993774414
+  },
+  "usd_output": "D:\\Labworks\\Project_mouse\\assets\\usd\\mouse_soft.usd"
+}
