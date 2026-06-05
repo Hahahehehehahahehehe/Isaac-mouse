@@ -1139,13 +1139,12 @@ def set_translate(stage, prim_path: str, xyz: tuple[float, float, float]) -> Non
 def disable_instanceable(stage, root_path: str) -> int:
     """Flatten instanceable references so the visual render mesh follows physics.
 
-    The FactoryFranka asset references instanceable prototypes. PhysX writes live
-    per-link transforms to Fabric, but with scene-graph instancing OFF the instanced
-    prototype geometry never receives those transforms — the white visual hand/fingers
-    freeze at the authored prototype (joints-zero) pose while the green collider debug
-    (authored as fresh non-instanced prims) tracks physics. That is the GUI "崩飞":
-    the visual gripper detaches from its colliders. Making every prim unique lets the
-    Fabric writeback drive the visual meshes too.
+    The FactoryFranka asset references instanceable prototypes. During approach the
+    gripper visuals can still follow the arm; at pinch (rigid↔deformable contact) PhysX
+    Fabric per-link writeback loses sync with instanceable prototype geometry (scene-
+    graph instancing OFF) and finger render meshes snap to the prototype rest pose while
+    non-instanced green collider debug prims keep tracking physics. Flattening instances
+    lets Fabric writeback drive the white visual meshes through pinch too.
     """
     from pxr import Usd
 
@@ -3050,10 +3049,9 @@ def build_scene(
 
     franka_usd = get_assets_root_path() + FRANKA_USD_REL
     stage_utils.add_reference_to_stage(franka_usd, FRANKA_ROOT)
-    # FactoryFranka ships instanceable prototypes; with omnihydra scene-graph instancing
-    # off, the instanced visual meshes ignore PhysX→Fabric per-link transforms and freeze
-    # at the prototype rest pose (the GUI gripper "崩飞"). Flatten to unique prims so the
-    # white hand/fingers render where physics actually puts them.
+    # FactoryFranka ships instanceable prototypes. Approach visuals can look fine; at pinch
+    # Fabric per-link writeback loses sync with instanced finger meshes (scene-graph
+    # instancing off) and they snap to prototype rest pose. Flatten so pinch visuals match physics.
     disable_instanceable(world.stage, FRANKA_ROOT)
 
     usd_context = omni.usd.get_context()

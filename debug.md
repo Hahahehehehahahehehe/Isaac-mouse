@@ -365,13 +365,24 @@ DEFAULT_FINGER_MAX_FORCE_N = 120
 
 ## Step 8 — 夹爪视觉 mesh 与 collider 分离（2026-06-05，已修复）
 
-### 现象
+### 现象（时序）
 
-GUI 中白色 Franka 手/手指视觉 mesh 停在空中（关节零位、z≈0.93 m），与绿色 finger collider 相差 **~700 mm**；绿色 debug collider 正常跟随物理。物理与 headless 抓取流程均正常。
+GUI 中问题**不是从第一帧就错**，而是分阶段出现：
+
+| 阶段 | 白色 Franka 视觉 | 绿色 collider debug |
+|------|------------------|---------------------|
+| **approach / descend** | 手/手指跟着机械臂移到夹取位姿，**看起来正常** | 正常 |
+| **pinch 开始、手指闭合并接触 FEM** | 手指视觉 mesh **突然弹回**原型 rest 姿态（关节零位、z≈0.93 m），与 collider 相差 **~700 mm** | 仍正常跟随物理 |
+
+物理与 headless 抓取流程全程正常；崩飞仅为**渲染路径**问题。
 
 ### 根因
 
-FactoryFranka USD 使用 **instanceable 原型**（scene-graph instancing）。PhysX 将每帧 link 变换写入 Fabric，但本 demo 未启用 omnihydra scene-graph instancing。实例化原型上的**视觉几何**收不到 per-instance 变换，冻结在原型 rest 姿态；后建的绿色 `PhysXColliderDebug_*` 为非实例化 prim，能跟 Fabric → 视觉与 collider 分离。
+FactoryFranka USD 使用 **instanceable 原型**（scene-graph instancing）。PhysX 将 link 变换写入 Fabric，但本 demo 未启用 omnihydra scene-graph instancing。
+
+- **approach / descend**：主要靠关节链驱动整条臂平移；手指保持大开，视觉靠父 link 变换仍能跟动，问题不明显。
+- **pinch + rigid↔deformable 接触**：手指独立闭合，Fabric 对 rigid link 写回加剧；**instanceable 原型上的手指视觉几何**在这条写回路径上失步，Hydra 退回原型 rest 姿态 → 接触后「崩飞」。
+- 绿色 `PhysXColliderDebug_*` 为后建的**非实例化**子 prim，只跟 link 局部坐标，不受原型 instancing 影响 → 始终与物理对齐。
 
 Kit 日志证据：
 
@@ -380,7 +391,11 @@ Kit 日志证据：
 in the stage but omnihydra scene graph instancing is not enabled!
 ```
 
-`log_link_render_vs_physics` 中 `usd=(0.158,0.350,0.926)` 恒定不变，是读 **USD stage 静态 authored 姿态**（非 Fabric 实时渲染），不能单独证明崩飞，但与上述 instancing 问题一致。
+### 诊断误读（勿混淆）
+
+`log_link_render_vs_physics` 仅在 **pinch / lift** 阶段打印；其中 `usd=(0.158,0.350,0.926)` 恒定不变，是读 **USD stage 静态 authored 姿态**（`TimeCode.Default()`），**不是** Hydra/Fabric 实时画面。
+
+同期 `panda_hand world pos = (0.520, …)` 来自 **physics view**，只说明物理正确，**不能**反推 approach 阶段视觉已错。用户 GUI 观察（先跟动、接触后失步）比该诊断更可信。
 
 ### 修复
 

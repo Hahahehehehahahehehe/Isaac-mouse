@@ -9,7 +9,7 @@ Repository: [github.com/Hahahehehehahahehehe/Isaac-mouse](https://github.com/Hah
 - **Pinch**: gripper closes on a silicone-like FEM mouse with real contact-driven deformation (after kinematic-flag fix, Step 6).
 - **Lift**: mouse rises with the gripper and passes grasp check (`mouse z` delta ≥ 45 mm).
 - **Alignment**: `get_body_grip_center()` places the TCP over the torso at a chosen Y slice and centres X on that slice (handles banana-curved body geometry).
-- **GUI gripper visuals**: white Franka hand/fingers follow physics (Step 8 — `disable_instanceable()` on load).
+- **GUI gripper visuals**: white Franka hand/fingers follow physics through pinch (Step 8 — `disable_instanceable()` fixes contact-triggered snap-back to rest pose).
 
 ## Known limitations (2026-06-05)
 

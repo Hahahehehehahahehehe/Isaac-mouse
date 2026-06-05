@@ -29,7 +29,7 @@ $py = "D:\Labworks\Project_Issac\.venv-isaacsim\Scripts\python.exe"
 | Lift 时小鼠不抬 | FEM nodal attachment 刚性跟随 gripper（Step 4c） |
 | Pinch 时 FEM 完全不形变 | kinematic flag 写反（`w=0`=pin, `w=1`=free）已修正（Step 6） |
 | 夹取点偏尾 / X 不对称 | `get_body_grip_center()`：按 Y 截面宽度识别躯干，在夹取 Y 窄带内算 X 中心（Step 7） |
-| 夹爪视觉 mesh 与绿色 collider 分离（GUI「崩飞」） | `disable_instanceable()`：加载 Franka 后取消 instanceable 原型（Step 8） |
+| 夹爪视觉 mesh 接触后弹回初始位（GUI「崩飞」） | `disable_instanceable()`：取消 instanceable 原型，修复 pinch 时 Fabric 写回失步（Step 8；approach 阶段视觉曾正常） |
 
 ---
 
