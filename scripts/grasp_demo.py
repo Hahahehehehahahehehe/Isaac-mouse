@@ -87,7 +87,10 @@ GRASP_HAND_HEIGHT_TOL_M = 0.08
 ARM_DRIVE_SETTLE_STEPS = 45
 
 # Grasp verification / replay timing (@ 60 Hz).
-GRASP_LIFT_DELTA_M = 0.045
+# Friction lift: centroid lags finger height when the soft body pitches (head sinks).
+GRASP_LIFT_DELTA_FRICTION_M = 0.012   # 12 mm centroid rise → grasp confirmed
+GRASP_LIFT_DELTA_ATTACHMENT_M = 0.045  # rigid nodal carry lifts the whole mesh
+GRASP_LIFT_DELTA_M = GRASP_LIFT_DELTA_FRICTION_M  # default (friction lift)
 REPLAY_KEY = "R"
 MOUSE_ROOT = "/World/MouseAsset"
 
@@ -95,9 +98,16 @@ MOUSE_ROOT = "/World/MouseAsset"
 # compresses under ~80 N finger force; 5e4 was too stiff, 5e3 sagged/tilted during settle.
 YOUNG_MODULUS = 1.0e4
 POISSON_RATIO = 0.48
-# 0.8 anchored the ~33 g mouse to the table (friction ≈ single-finger contact force), so the
-# first finger could not slide the mouse toward the other finger to self-center. 0.2 lets it slide.
-DEFORMABLE_FRICTION = 0.2
+# Mouse↔gripper friction for lift (PhysX deformable dynamic friction). Table sliding uses a
+# separate zero-friction material on the kinematic table cube — not this value.
+# 0.2 was for easy slide-to-self-center; raised for friction-based lift (Step 9).
+DEFORMABLE_FRICTION = 6.0
+GRIPPER_FRICTION = 6.0  # static + dynamic on finger/hand rigid colliders
+FRICTION_LIFT_GRIP_CREEP_M = 0.0003   # per-frame per-finger close during friction lift (0.3 mm)
+FRICTION_LIFT_GRIP_MIN_M = 0.004      # keep creeping closed until 4 mm/finger (8 mm total)
+LIFT_MODE_FRICTION = "friction"
+LIFT_MODE_ATTACHMENT = "attachment"
+DEFAULT_LIFT_MODE = LIFT_MODE_FRICTION
 DEFORMABLE_DAMPING = 0.005
 SIM_HEX_RESOLUTION = 8
 MOUSE_GRAVITY_SETTLE_STEPS = 90
@@ -118,7 +128,7 @@ DEFAULT_FINGER_CONTACT_OFFSET_M = 0.001  # 1 mm
 DEFAULT_FINGER_REST_OFFSET_M = 0.0
 DEFAULT_FINGER_KP = 800.0    # low stiffness prevents ejection when finger meets deformable contact
 DEFAULT_FINGER_KD = 100.0
-DEFAULT_FINGER_MAX_FORCE_N = 120.0  # increased for visible FEM compression (was 80 N)
+DEFAULT_FINGER_MAX_FORCE_N = 180.0  # higher for friction lift normal force (was 120 N)
 GRIPPER_PINCH_CLOSE_CREEP_M = 0.0002  # max per-finger close step per frame when blocked (0.2 mm)
 PINCH_AUTO_MOUSE_FILTER = False  # filter=none: keep gripper↔mouse contact live (real squeeze + deformation); ejection handled by low PD + soft close
 # Kinematic-pin the mouse to the table during approach/descend.
@@ -134,11 +144,13 @@ TABLE_PIN_ENABLED = False
 # Physics steps between key poses (@ 60 Hz).
 STEPS_APPROACH = 120   # home → hover above mouse (gripper open)
 STEPS_DESCEND  = 220   # hover → straddle (descend to grasp level, gripper still open)
-LIFT_DURATION_STEPS = 180
-MAX_GRASP_STEPS = 900
 GRIPPER_CLOSE_STEPS = 60          # ramp command open → GRIPPER_CLAMP_M
 GRIPPER_SQUEEZE_STEPS = 45        # keep forcing target after ramp (soft body compression)
 GRIPPER_CLAMP_HOLD_STEPS = 120    # hold forced clamp at straddle height before lift (~2 s)
+_PINCH_MAX_STEPS = GRIPPER_CLOSE_STEPS + GRIPPER_SQUEEZE_STEPS + GRIPPER_CLAMP_HOLD_STEPS
+LIFT_DURATION_STEPS = 360  # ~6 s @ 60 Hz; arm travel ∝ lift_steps/LIFT_DURATION (linear in t)
+# Must cover descend + full pinch + lift; old fixed 900 capped lift to ~455 frames (see below).
+MAX_GRASP_STEPS = STEPS_DESCEND + _PINCH_MAX_STEPS + LIFT_DURATION_STEPS + 80
 GRASP_CHECK_START = STEPS_DESCEND + GRIPPER_CLOSE_STEPS + 20
 
 # Step4 force/compliant pinch — keep gripper↔mouse contact (filter=none).
@@ -152,9 +164,8 @@ GRIPPER_COMPLIANT_CREEP_M = 0.00025     # per-frame position target step toward 
 PINCH_STALL_VEL_MM_S = 0.08             # finger joint speed below this => blocked
 PINCH_STALL_FRAMES = 20                 # consecutive stalled frames before hold
 
-# Grip attachment: once clamped, FEM nodes near the fingers are kinematically carried with the
-# hand during the lift. A parallel gripper cannot lift a soft body by friction alone (the sibling
-# Project_Issac demo uses the same attachment trick), so this makes the mouse rise with the gripper.
+# Grip attachment (fallback --lift-mode attachment): kinematically carry FEM nodes with the hand.
+# Default lift is friction-based (high mouse + finger friction); attachment remains for comparison.
 GRASP_ATTACH_RADIUS_M = 0.055  # capture most of the mouse body (was 30 mm → too few nodes)
 GRASP_ATTACH_BOX_SCALE = 0.55    # fraction of MOUSE_PROBE_EXT_XYZ half-extents for box capture
 _grasp_attach_indices = None
@@ -285,6 +296,25 @@ def parse_args() -> argparse.Namespace:
         help="deformable=soft FEM mouse (default); rigid-box=Step1 kinematic box control (see debug.md).",
     )
     parser.add_argument(
+        "--lift-mode",
+        choices=(LIFT_MODE_FRICTION, LIFT_MODE_ATTACHMENT),
+        default=DEFAULT_LIFT_MODE,
+        help="Lift strategy: friction=pinch squeeze + high friction (default); "
+        "attachment=legacy FEM nodal kinematic carry.",
+    )
+    parser.add_argument(
+        "--mouse-friction",
+        type=float,
+        default=DEFORMABLE_FRICTION,
+        help="Deformable mouse dynamic friction coefficient (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--gripper-friction",
+        type=float,
+        default=GRIPPER_FRICTION,
+        help="Finger/hand collider static+dynamic friction (default: %(default)s).",
+    )
+    parser.add_argument(
         "--pinch-mode",
         choices=("position", "force", "compliant"),
         default="position",
@@ -396,6 +426,28 @@ def force_gripper_spacing(robot, finger_m: float) -> None:
     pos[..., 7] = finger_m
     pos[..., 8] = finger_m
     view.set_joint_position_targets(pos)
+
+
+def apply_joint_lift_step(robot, start_arm_q, lift_t: float, gripper_m: float) -> None:
+    """Joint-space lift from pinch pose toward ARM_LIFT_DEG (keeps finger–body alignment)."""
+    import torch
+
+    if not robot.handles_initialized or not robot._articulation_view.is_physics_handle_valid():
+        return
+    device = robot._articulation_view._device
+    lift_arm = torch.tensor(
+        [math.radians(d) for d in ARM_LIFT_DEG], dtype=torch.float32, device=device
+    )
+    if torch.is_tensor(start_arm_q):
+        start = start_arm_q.detach().clone().reshape(-1)[:7].to(device)
+    else:
+        start = torch.as_tensor(start_arm_q, dtype=torch.float32, device=device).reshape(-1)[:7]
+    t = max(0.0, min(1.0, float(lift_t)))
+    targets = torch.zeros(9, dtype=torch.float32, device=device)
+    targets[:7] = start * (1.0 - t) + lift_arm * t
+    targets[7] = gripper_m
+    targets[8] = gripper_m
+    robot._articulation_view.set_joint_position_targets(targets.unsqueeze(0))
 
 
 def apply_frozen_arm_gripper(robot, arm_q, gripper_m: float, *, soft_close: bool = False) -> None:
@@ -662,6 +714,38 @@ def set_gripper_collider_offsets(stage, contact_m: float, rest_m: float) -> int:
         ):
             count += 1
     print(f"[grasp_demo] gripper collider offset pass: {count} prim(s)", flush=True)
+    return count
+
+
+def set_gripper_friction(stage, friction: float) -> int:
+    """Bind a high-friction physics material to finger/hand CollisionAPI prims."""
+    from pxr import Usd, UsdPhysics, UsdShade
+
+    mat_path = f"{FRANKA_ROOT}/GripperPhysicsMaterial"
+    mat = UsdShade.Material.Define(stage, mat_path)
+    phys_mat = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
+    phys_mat.CreateStaticFrictionAttr(friction)
+    phys_mat.CreateDynamicFrictionAttr(friction)
+    phys_mat.CreateRestitutionAttr(0.0)
+
+    count = 0
+    root = stage.GetPrimAtPath(FRANKA_ROOT)
+    if not root.IsValid():
+        return 0
+    for prim in Usd.PrimRange(root):
+        if not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        path = str(prim.GetPath()).lower()
+        if not any(k in path for k in ("finger", "hand", "gripper")):
+            continue
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+            mat, bindingStrength=UsdShade.Tokens.weakerThanDescendants, materialPurpose="physics"
+        )
+        count += 1
+    print(
+        f"[grasp_demo] gripper friction pass: {count} collider(s) @ μ={friction:.2f}",
+        flush=True,
+    )
     return count
 
 
@@ -3012,6 +3096,8 @@ def build_scene(
     deform_rest_offset_m: float = DEFAULT_DEFORM_REST_OFFSET_M,
     finger_contact_offset_m: float = DEFAULT_FINGER_CONTACT_OFFSET_M,
     finger_rest_offset_m: float = DEFAULT_FINGER_REST_OFFSET_M,
+    mouse_friction: float = DEFORMABLE_FRICTION,
+    gripper_friction: float = GRIPPER_FRICTION,
 ):
     import isaacsim.core.utils.stage as stage_utils
     import omni.usd
@@ -3110,8 +3196,12 @@ def build_scene(
             prim_path=mat_path,
             youngs_modulus=YOUNG_MODULUS,
             poissons_ratio=POISSON_RATIO,
-            dynamic_friction=DEFORMABLE_FRICTION,
+            dynamic_friction=mouse_friction,
             elasticity_damping=DEFORMABLE_DAMPING,
+        )
+        print(
+            f"[grasp_demo] mouse deformable friction μ={mouse_friction:.2f}",
+            flush=True,
         )
 
         deformable = SingleDeformablePrim(
@@ -3152,6 +3242,8 @@ def build_scene(
         )
     elif mouse_mode == "deformable":
         print("[grasp_demo] contact offsets: gripper unchanged (PhysX defaults)", flush=True)
+    if mouse_mode == "deformable":
+        set_gripper_friction(world.stage, gripper_friction)
 
     light_path = "/World/DomeLight"
     if not world.stage.GetPrimAtPath(light_path).IsValid():
@@ -3308,6 +3400,7 @@ def run_demo_sequence(
     mouse_mode: str = "deformable",
     collision_path: str | None = None,
     pinch_mode: str = "position",
+    lift_mode: str = DEFAULT_LIFT_MODE,
 ) -> bool:
     if collision_path is None:
         collision_path = mouse_collision_path(mesh_path, mouse_mode)
@@ -3334,8 +3427,8 @@ def run_demo_sequence(
     print(f"[grasp_demo] robot dofs={robot.num_dof} names={robot.dof_names}", flush=True)
     print(
         f"[grasp_demo] mouse-mode={mouse_mode}, collision-path={collision_path}, "
-        f"filter={collision_filter_mode}, pinch-mode={pinch_mode}, table_top_z={TABLE_TOP_Z:.3f}, "
-        f"pinch target {GRIPPER_CLAMP_M * 2000:.0f} mm",
+        f"filter={collision_filter_mode}, pinch-mode={pinch_mode}, lift-mode={lift_mode}, "
+        f"table_top_z={TABLE_TOP_Z:.3f}, pinch target {GRIPPER_CLAMP_M * 2000:.0f} mm",
         flush=True,
     )
     if pinch_mode in ("force", "compliant") and collision_filter_mode != "none":
@@ -3368,6 +3461,8 @@ def run_demo_sequence(
     grasp_anchor: tuple[float, float, float] | None = None
     pinch_steps = 0
     lift_steps = 0
+    lift_gripper_m = GRIPPER_CLAMP_M
+    lift_start_arm_q = None
     attachment_done = False
     pinch_arm_q = None
     pinch_hold_start: int | None = None
@@ -3582,8 +3677,16 @@ def run_demo_sequence(
                     phase = "lift"
                     grasp_anchor = pinch_anchor
                     lift_steps = 0
+                    lift_start_arm_q = (
+                        pinch_arm_q.detach().clone() if pinch_arm_q is not None else None
+                    )
                     log_gripper_state(robot, "lift_start")
-                    if deformable is not None and mouse_mode == "deformable":
+                    attachment_done = False
+                    if (
+                        lift_mode == LIFT_MODE_ATTACHMENT
+                        and deformable is not None
+                        and mouse_mode == "deformable"
+                    ):
                         hand_pos0, _ = get_hand_world_pose(hand_view)
                         grip_center0 = (
                             float(hand_pos0[0]),
@@ -3594,6 +3697,17 @@ def run_demo_sequence(
                         attachment_done = n > 0
                         if attachment_done:
                             update_mouse_attachment(deformable, grip_center0)
+                    elif lift_mode == LIFT_MODE_FRICTION:
+                        fs = get_finger_joint_state(robot)
+                        if fs is not None:
+                            lift_gripper_m = min(fs[0], fs[1])
+                        else:
+                            lift_gripper_m = GRIPPER_CLAMP_M
+                        print(
+                            f"[grasp_demo] lift via friction (no FEM nodal attachment), "
+                            f"hold/creep from {lift_gripper_m * 1000:.1f} mm/finger",
+                            flush=True,
+                        )
                     print(
                         f"[grasp_demo] pinch hold complete at step {step} — start vertical lift from "
                         f"({grasp_anchor[0]:.3f}, {grasp_anchor[1]:.3f}, {grasp_anchor[2]:.3f})",
@@ -3605,8 +3719,13 @@ def run_demo_sequence(
             t = min(1.0, lift_steps / max(1, LIFT_DURATION_STEPS))
             lift_delta = GRASP_LIFT_Z_OFFSET_M - GRASP_STRADDLE_Z_OFFSET_M
             target_xyz = (grasp_anchor[0], grasp_anchor[1], grasp_anchor[2] + lift_delta * t)
-            gripper_m = GRIPPER_CLAMP_M if pinch_mode == "position" else pinch_hold_gripper_m
-            force_grip = False  # hold opening during lift — re-squeeze blows finger links off
+            if lift_mode == LIFT_MODE_FRICTION:
+                if lift_gripper_m > FRICTION_LIFT_GRIP_MIN_M:
+                    lift_gripper_m = max(FRICTION_LIFT_GRIP_MIN_M, lift_gripper_m - FRICTION_LIFT_GRIP_CREEP_M)
+                gripper_m = lift_gripper_m
+            else:
+                gripper_m = GRIPPER_CLAMP_M if pinch_mode == "position" else pinch_hold_gripper_m
+            force_grip = False
             if lift_steps >= LIFT_DURATION_STEPS:
                 phase = "done"
 
@@ -3620,8 +3739,14 @@ def run_demo_sequence(
                 apply_frozen_arm_gripper(
                     robot, pinch_arm_q, gripper_m, soft_close=force_grip
                 )
+        elif phase == "lift" and lift_mode == LIFT_MODE_FRICTION and lift_start_arm_q is not None:
+            t = min(1.0, lift_steps / max(1, LIFT_DURATION_STEPS))
+            apply_joint_lift_step(robot, lift_start_arm_q, t, gripper_m)
+            force_gripper_spacing(robot, gripper_m)
         else:
             apply_cartesian_ik_step(robot, hand_view, target_xyz, gripper_m)
+            if phase == "lift" and lift_mode == LIFT_MODE_FRICTION:
+                force_gripper_spacing(robot, gripper_m)
 
         if deformable is not None:
             if phase in ("approach", "descend"):
@@ -3897,6 +4022,8 @@ def main() -> int:
             deform_rest_offset_m=args.deform_rest_offset_mm / 1000.0,
             finger_contact_offset_m=args.finger_contact_offset_mm / 1000.0,
             finger_rest_offset_m=args.finger_rest_offset_mm / 1000.0,
+            mouse_friction=args.mouse_friction,
+            gripper_friction=args.gripper_friction,
         )
         if args.hide_collision_debug:
             debug.enabled = False
@@ -3942,6 +4069,7 @@ def main() -> int:
                     mouse_mode=mouse_mode,
                     collision_path=collision_path,
                     pinch_mode=args.pinch_mode,
+                    lift_mode=args.lift_mode,
                 )
 
                 if args.headless or args.diagnose_pinch:

@@ -419,29 +419,80 @@ disable_instanceable(world.stage, FRANKA_ROOT)
 
 ---
 
-## 已知限制（当前版本）
+## Step 9 — 摩擦 lift（2026-06-05）
 
-1. **Pinch**：FEM 接触驱动形变 ✓（headless 可验证 X-span 变化）。
-2. **Lift**：`attach_mouse_to_hand` 节点刚性跟随 ✗ 非摩擦力。
-3. **显示**：夹爪视觉 ✓（Step 8）；小鼠白色 render mesh 在快速 pinch 时仍可能抖动，以 FEM 日志为准。
-4. **开度**：`GRIPPER_CLAMP_M` 为命令值，实际 `f1+f2` 可能更大。
+### 目标
+
+默认 lift 从 FEM nodal attachment 改为**摩擦夹持**；提高小鼠体表与夹爪 collider 摩擦系数。
+
+### 实现
+
+| 项 | 内容 |
+|----|------|
+| 默认模式 | `--lift-mode friction`（`--lift-mode attachment` 保留旧方案） |
+| 小鼠摩擦 | `DEFORMABLE_FRICTION`（DeformableMaterial dynamic friction） |
+| 夹爪摩擦 | `set_gripper_friction()` → finger/hand `UsdPhysics.MaterialAPI` |
+| Lift 驱动 | `apply_joint_lift_step`：pinch 关节姿态 → `ARM_LIFT_DEG` 插值 |
+| Lift 夹紧 | `FRICTION_LIFT_GRIP_CREEP_M` 每帧微收；`force_gripper_spacing` |
+| CLI | `--mouse-friction` / `--gripper-friction` |
+
+### 判定阈值
+
+| lift-mode | 条件 |
+|-----------|------|
+| `friction` | FEM 质心 Δz ≥ **12 mm**（`GRASP_LIFT_DELTA_FRICTION_M`） |
+| `attachment` | FEM 质心 Δz ≥ **45 mm**（`GRASP_LIFT_DELTA_ATTACHMENT_M`） |
+
+质心在摩擦 lift 时**低于手指抬升高度**：软体抬头下沉（pitch），GUI 已抬离桌面时 headless 质心可能仅 ~7–10 mm。
+
+### Pinch「二次发力」
+
+```
+close 60 帧（线性逼近 GRIPPER_CLAMP_M，force_grip=False）
+  → 首次接触，软体弹性回弹
+squeeze 45 帧（force_grip=True，每帧 soft_close 0.2 mm/指）
+  → GUI 可见第二次收紧
+hold 120 帧 → lift
+```
+
+### 抬升速度与步数预算
+
+- `t = lift_steps / LIFT_DURATION_STEPS`；行程固定时**平均速度 ∝ 1/LIFT_DURATION_STEPS**。
+- 当前 `LIFT_DURATION_STEPS = 360`（~6 s @ 60 Hz）。
+- `MAX_GRASP_STEPS = STEPS_DESCEND + _PINCH_MAX_STEPS + LIFT_DURATION_STEPS + 80`（自动缩放）。
+- **陷阱**：旧固定 `MAX_GRASP_STEPS=900` 时，lift 约从 step 446 开始；`LIFT_DURATION=720` 需 step 1166 才结束，循环在 900 被截断 → 只完成 ~63% 抬升。
+
+### GUI 验证（μ=6.0，LIFT=360）
+
+- 可夹起并抬离桌面，达到预期；持握一段时间后可能滑脱。
+- 日志示例：`lift via friction`；`grasp not confirmed`（质心 Δz=7 mm）与视觉成功可并存。
+
+- [x] Step 9 完成（摩擦 lift 默认可用；attachment 作回退）
 
 ---
 
-## 常量（2026-06-05）
+## 已知限制（当前版本）
+
+1. **Pinch**：FEM 接触驱动形变 ✓。
+2. **Lift（默认）**：摩擦夹持 ✓（GUI）；质心判定偏保守；可能滑脱。
+3. **Lift（attachment）**：整网刚性平移 ✓（headless 稳定）。
+4. **显示**：夹爪视觉 ✓（Step 8）；小鼠 render mesh 可能抖动。
+5. **开度**：命令 14 mm，实际常更大。
+
+---
+
+## 常量（2026-06-05，Step 9）
 
 ```
-GRIPPER_CLAMP_M          = 0.007  → 14 mm 总开口命令
-GRIPPER_OPEN_M           = 0.04   → 80 mm 全开
-GRASP_BODY_Y_FRAC        = 0.4
-GRASP_BODY_X_OFFSET_M    = -0.0024
-DEFAULT_DEFORM_CONTACT   = 2 mm
-DEFAULT_FINGER_CONTACT   = 1 mm
-DEFAULT_FINGER_KP        = 800
-DEFAULT_FINGER_MAX_FORCE = 120 N
-YOUNG_MODULUS            = 1e4 Pa
-DEFORMABLE_FRICTION      = 0.2
-TABLE_PIN_ENABLED        = False
-Tuned 2+1 mm + none      ≈ 22–25 mm 实际 pinch（命令 14 mm）
-Lift delta (4c)          ≥ +0.045 m → grasp confirmed（attachment）
+GRIPPER_CLAMP_M               = 0.007  → 14 mm 命令
+GRASP_BODY_Y_FRAC             = 0.4
+GRASP_BODY_X_OFFSET_M         = -0.0024
+DEFORMABLE_FRICTION           = 6.0
+GRIPPER_FRICTION              = 6.0
+DEFAULT_FINGER_MAX_FORCE_N    = 180
+LIFT_DURATION_STEPS           = 360
+GRASP_LIFT_DELTA_FRICTION_M   = 0.012  (12 mm)
+GRASP_LIFT_DELTA_ATTACHMENT_M = 0.045  (45 mm)
+DEFAULT_LIFT_MODE             = friction
+Tuned 2+1 mm + none           ≈ 22–25 mm 实际 pinch
 ```

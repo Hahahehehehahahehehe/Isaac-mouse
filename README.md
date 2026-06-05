@@ -6,21 +6,22 @@ Repository: [github.com/Hahahehehehahahehehe/Isaac-mouse](https://github.com/Hah
 
 ## What works today
 
-- **Pinch**: gripper closes on a silicone-like FEM mouse with real contact-driven deformation (after kinematic-flag fix, Step 6).
-- **Lift**: mouse rises with the gripper and passes grasp check (`mouse z` delta ≥ 45 mm).
-- **Alignment**: `get_body_grip_center()` places the TCP over the torso at a chosen Y slice and centres X on that slice (handles banana-curved body geometry).
-- **GUI gripper visuals**: white Franka hand/fingers follow physics through pinch (Step 8 — `disable_instanceable()` fixes contact-triggered snap-back to rest pose).
+- **Pinch**: gripper closes on a silicone-like FEM mouse with real contact-driven deformation (Step 6 kinematic-flag fix).
+- **Lift (default)**: friction-based carry — high mouse + finger friction, joint-space lift; GUI shows the mouse rising with the gripper (Step 9).
+- **Lift (fallback)**: `--lift-mode attachment` — legacy FEM nodal kinematic carry (`attach_mouse_to_hand`).
+- **Alignment**: `get_body_grip_center()` places the TCP over the torso at a chosen Y slice and centres X on that slice.
+- **GUI gripper visuals**: white Franka hand/fingers follow physics through pinch (Step 8 — `disable_instanceable()`).
 
 ## Known limitations (2026-06-05)
 
 | Issue | Status |
 |-------|--------|
-| **Mouse FEM visual jitter** during pinch | FEM sim is OK; mouse white render mesh may still jitter when nodes move fast (skinning artifact). Gripper visuals fixed in Step 8. |
-| **Lift is not friction-based** | Parallel gripper cannot lift soft silicone by friction alone; lift uses **FEM nodal attachment** (`attach_mouse_to_hand` + per-frame `set_simulation_mesh_nodal_positions`). |
-| **Commanded vs actual pinch opening** | Target may be 14 mm total (`GRIPPER_CLAMP_M=0.007`) but physics stalls higher (~20–24 mm) when contact + max finger force balance out. |
-| **GUI vs physics (mouse only)** | Mouse render mesh can look like penetration during fast deformation; trust FEM logs / headless metrics for mouse physics. |
+| **Mouse FEM visual jitter** during pinch | FEM sim is OK; render mesh may jitter (skinning artifact). Gripper visuals fixed in Step 8. |
+| **Friction lift slip** | Mouse may slide out of the gripper after several seconds; centroid rise lags finger height when the head pitches down during lift. |
+| **Commanded vs actual pinch opening** | Target 14 mm total (`GRIPPER_CLAMP_M=0.007`); physics often stalls ~20–24 mm. |
+| **Grasp metric vs GUI** | `grasp confirmed` uses FEM **centroid** Δz (12 mm for friction, 45 mm for attachment) — lower than visual lift when the body tilts. |
 
-See `debug.md` (Steps 0–8) and `HANDOFF.md` for full history and tuning notes.
+See `debug.md` (Steps 0–9) and `HANDOFF.md` for full history and tuning notes.
 
 ## Requirements
 
@@ -36,36 +37,60 @@ Large source meshes (`*.glb`, Blender `.blend`) are **not** in this repo. Regene
 $env:OMNI_KIT_ACCEPT_EULA = "YES"
 $py = "D:\Labworks\Project_Issac\.venv-isaacsim\Scripts\python.exe"
 
-# GUI (hide debug overlays)
+# GUI — friction lift (default)
 & $py scripts\grasp_demo.py --hide-collision-debug --hide-gripper-debug --no-export
 
-# Headless full sequence (pinch → lift)
+# Legacy kinematic carry (Step 4c)
+& $py scripts\grasp_demo.py --lift-mode attachment --hide-collision-debug --hide-gripper-debug --no-export
+
+# Headless full sequence
 & $py scripts\grasp_demo.py --headless --no-export
 
 # Pinch diagnosis only (no lift)
 & $py scripts\grasp_demo.py --headless --diagnose-pinch --collision-filter none --no-export
 ```
 
+### CLI options (lift / friction)
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--lift-mode friction` | ✓ | Pinch squeeze + friction; no FEM nodal attachment |
+| `--lift-mode attachment` | | Legacy whole-mesh kinematic carry |
+| `--mouse-friction` | 6.0 | Deformable mouse dynamic friction μ |
+| `--gripper-friction` | 6.0 | Finger/hand collider static+dynamic friction μ |
+
 ## Tuning knobs (`scripts/grasp_demo.py` top)
 
-Three main parameters for grasp pose and squeeze depth:
+**Grasp pose & squeeze**
 
 | Constant | Meaning |
 |----------|---------|
-| `GRASP_BODY_Y_FRAC` | Where along the body (head–tail, 0=tail … 1=head) to grasp. Current: **0.4** (abdomen/rib area). |
-| `GRASP_BODY_X_OFFSET_M` | Fine X shift of grip target (m). Current: **−0.0024** (−2.4 mm). |
-| `GRIPPER_CLAMP_M` | Per-finger close target (m); total opening = `× 2`. Current: **0.007** → **14 mm** total command. |
+| `GRASP_BODY_Y_FRAC` | Where along the body (0=tail … 1=head). Current: **0.4**. |
+| `GRASP_BODY_X_OFFSET_M` | Fine X shift (m). Current: **−0.0024**. |
+| `GRIPPER_CLAMP_M` | Per-finger close target (m); total = ×2. Current: **0.007** → **14 mm** command. |
 
-Related: `GRASP_BODY_Y_OFFSET_M`, `DEFAULT_FINGER_MAX_FORCE_N` (120 N), `DEFAULT_DEFORM_CONTACT_OFFSET_M` (2 mm), `DEFAULT_FINGER_CONTACT_OFFSET_M` (1 mm).
+**Friction lift (Step 9)**
+
+| Constant | Meaning |
+|----------|---------|
+| `DEFORMABLE_FRICTION` / `GRIPPER_FRICTION` | Mouse + finger μ. Current: **6.0** each. |
+| `LIFT_DURATION_STEPS` | Lift length @ 60 Hz. Current: **360** (~6 s). Speed ∝ 1/steps. |
+| `GRASP_LIFT_DELTA_FRICTION_M` | Centroid rise for `grasp confirmed`. Current: **12 mm**. |
+| `DEFAULT_FINGER_MAX_FORCE_N` | Finger squeeze cap. Current: **180 N**. |
+
+Related: `DEFAULT_DEFORM_CONTACT_OFFSET_M` (2 mm), `DEFAULT_FINGER_CONTACT_OFFSET_M` (1 mm).
+
+**Note**: `MAX_GRASP_STEPS` auto-scales with `LIFT_DURATION_STEPS`. Do not set lift duration above ~455 while `MAX_GRASP_STEPS` is fixed at 900 (old behaviour) — use the current auto formula instead.
 
 ## Grasp sequence (60 Hz)
 
 ```
-prepare_run → approach (hover) → descend (straddle) → pinch (close + squeeze + hold)
-    → lift (FEM nodal attachment carry) → grasp confirmed if Δz ≥ 45 mm
+prepare_run → approach → descend → pinch (close 60f → squeeze 45f → hold 120f)
+    → lift (friction: joint-space to ARM_LIFT_DEG + grip creep)
+    → grasp confirmed if centroid Δz ≥ 12 mm (friction) or ≥ 45 mm (attachment)
 ```
 
-**Important**: pinch deformation is physical (FEM contact). **Lift is kinematic carry**, not friction grasp.
+**Pinch** is physical FEM contact. **Default lift** is friction, not nodal attachment. Pinch has a visible **second squeeze** after first contact (`GRIPPER_SQUEEZE_STEPS`, `force_grip=True`).
 
 ## Project layout
 
@@ -75,7 +100,7 @@ prepare_run → approach (hover) → descend (straddle) → pinch (close + squee
 | `scripts/push_test.py` | Diagnostic: kinematic block push vs FEM |
 | `scripts/phase2_*.py` | Mesh prep & USD export |
 | `assets/usd/mouse_soft.usd` | Deformable mouse asset |
-| `debug.md` | Debug log Steps 0–8 |
+| `debug.md` | Debug log Steps 0–9 |
 | `HANDOFF.md` | Session handoff & current status |
 | `plan.md` | Pipeline roadmap |
 
