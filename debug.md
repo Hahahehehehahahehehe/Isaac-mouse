@@ -224,17 +224,168 @@ Hull 几何、palm 自碰撞、桌面摩擦、IK 抢约束、joint 损坏、GPU 
 | 2026-05-29 | Step 1：rigid-box+none→43.5 mm / 11 N contact；deformable 仍 64.8 mm |
 | 2026-05-29 | Step 4b：contactOffset 修复；unset→64.8 mm，tuned 2+1 mm→**30 mm** |
 | 2026-05-30 | Step 4c：post-step nodal carry；**grasp confirmed** mouse z +46 mm，`filter=none` |
+| 2026-06-04 | Step 5：系统性穷举；当时误判为「刚体无法横向推动 FEM」（见下，已被 Step 6 推翻） |
+| 2026-06-05 | Step 6：kinematic flag 写反（w=0=pin,w=1=free），修复后 FEM 正常形变 |
+| 2026-06-05 | Step 7：`get_body_grip_center()` 躯干 Y 截面 X 对中；手动调 Y_FRAC/X_OFFSET；见下 |
 
 ---
 
-## 常量
+## Step 5 — 刚体↔FEM 接触机制穷举（2026-06-04）
+
+### 背景
+
+Step 4c 后 pinch 正常、lift 正常，但 GUI/Headless 均无法看到软体在 pinch 时形变或被横向推动。
+小鼠 FEM 节点在 pinch 期间 centroid/X-span 全程冻结到机器精度（4 位小数不变），如：
 
 ```
-GRIPPER_CLAMP_M = 0.012  → 24 mm target
-Stuck (offset unset)     ≈ 64.8 mm
-Tuned 2+1 mm + none      ≈ 26–30 mm (pinch→lift)
-Closed (mouse filter)    ≈ 25.5 mm (穿模)
-Lift delta (4c)          ≥ +0.045 m → grasp confirmed
-DEFAULT_DEFORM_CONTACT   = 2 mm (physxCollision on mesh)
-DEFAULT_FINGER_CONTACT   = 1 mm (finger/hand colliders)
+mouse dyn [pinch s225~s435]: centroid=(0.5253,0.3526,0.1876) X-span=43.0mm
+```
+
+排查过以下假设（全部被数据排除）：
+
+| 假设 | 否定证据 |
+|------|---------|
+| 小鼠被 kinematic pin 钉死 → w=0 释放失败 | 手指物理坐标已插入小鼠 hull 内（Lfinger X=0.535，hull xmin=0.5056），若钉死则手指被挡住，不会穿入 |
+| sleep_threshold 过高 → FEM 睡眠冻结 | 改 `sleep_threshold=0` + 每帧 `wake_deformable()` 回写速度缓冲，结果零变化 |
+| kinematic pin 残留（w=0 API 不可靠） | `TABLE_PIN_ENABLED=False` 全局禁用所有 pin 调用；deformable 改由接触支撑在桌面——仍零位移 |
+| collision_simplification 影响接触耦合 | 改 `True`（93 节点碰撞网格），结果零变化 |
+| GPU CUDA 问题（无 N 卡） | 日志确认 RTX 4060 Laptop（device 0, Active, CUDA 12.8/sm_89）正常工作 |
+
+### 决定性控制实验（6 组）
+
+| # | 配置 | 手指最终开度 | FEM 仿真网格 |
+|---|------|------------|------------|
+| 1 | 软体 + 2 mm offset + pin 开 | 穿到 27.9 mm | **冻结** |
+| 2 | 软体 + 无 offset（PhysX 默认）+ pin 开 | **卡在 64 mm**（被挡住） | **冻结** |
+| 3 | **刚性盒** + 2 mm offset | 停在 43.5 mm（几何接触） | 接触力 L 3.26 N / R 3.20 N ✓ |
+| 4 | 软体 + 2 mm offset + **pin 全关** | 穿到 27.9 mm | **冻结** |
+| 5 | 软体 + 无 offset + **pin 全关** | 卡在 64 mm | **冻结** |
+| 6 | **kinematic 刚体块**横向推 300 步（总推进 150 mm）| 块深入小鼠身体 | **冻结（零位移）** |
+
+实验 #5 是决定性的：pin 已全关（小鼠自由）、桌面无摩擦、默认大接触距离可以把手指**挡在 64 mm** 处（接触约束进入了关节求解器），但自由的 FEM 节点四位小数全程不变。
+
+实验 #6 用 `--push-test` 模式独立验证：一个 **kinematic 刚体块**以 0.5 mm/帧推了 300 帧（150 mm），最终深入小鼠身体内，FEM 节点 centroid X shift = **0.000 mm**。
+
+### ⚠️ Step 5 结论已被推翻（2026-06-05）
+
+> ~~**在 Isaac Sim 5.1 + PhysX GPU FEM 当前配置下，任何刚性物体（关节驱动或 kinematic）都无法通过接触力横向推动 GPU FEM 软体仿真网格。**~~
+
+**Step 5 的结论是错误的。** 真正原因是 `set_mouse_kinematic_pin` 里 kinematic flag 的含义写反了。
+
+PhysX / Isaac Lab 约定（`write_nodal_kinematic_target_to_sim` 官方文档）：
+- `w = 0.0` → kinematic（钉死）
+- `w = 1.0` → free（自由）
+
+旧代码写的是 `w = 1.0 if enabled else 0.0`，且 `TABLE_PIN_ENABLED=False` 让所有调用走 `enabled=False` 分支，全程写 `w=0`，等于把所有 FEM 节点钉成 kinematic。手指物理位置"插入" hull 内只是接触约束进了关节求解器让手指停住，FEM 节点本身被冻结、不受力，所以 centroid/X-span 机器精度不变——**不是 PhysX 的物理限制，是代码 bug**。
+
+`release_mouse_table_pin → set_mouse_kinematic_pin(False) → w=0` 也没有真正释放节点（w=0 本身就是 pin 值），与社区 [#5079](https://github.com/isaac-sim/IsaacLab/issues/5079)「节点释放后仍冻结」是同类问题。
+
+修复（2026-06-05）：改为 `w = 0.0 if enabled else 1.0`。修复后 headless 验证：
+
+```
+mouse dyn [pinch s225~s270]: X-span 43.0→54.0→55.2 mm（逐帧增大，FEM 真实形变）
+grasp confirmed at step 528 (mouse lifted): mouse z=0.233 (+0.045 m)
+```
+
+### 注意：桌面支撑仍有效
+
+`TABLE_PIN_ENABLED=False` 后，重力沉降 90 步确认小鼠靠接触稳停桌面（`collision contact=0.180, table=0.180`），无需 kinematic pin。pin 机制保持禁用，小鼠由真实接触支撑。
+
+---
+
+## Step 6 — kinematic flag 修复与新现象（2026-06-05）
+
+### 根因
+
+`set_simulation_mesh_kinematic_targets` 第 4 分量约定：**`w=0` = kinematic，`w=1` = free**（PhysX / Isaac Lab 官方）。旧代码把含义写反，导致整个 approach / descend / pinch 期间所有 FEM 节点全程被 `w=0` 钉死，接触力无法进入 FEM 求解器，与「接触力单向」假说的表现完全一致，但原因截然不同。
+
+**修复**（`scripts/grasp_demo.py`）：
+
+```python
+# 修复前（错误）
+targets[..., 3] = 1.0 if enabled else 0.0
+# 修复后（正确）
+targets[..., 3] = 0.0 if enabled else 1.0  # w=0=kinematic, w=1=free
+```
+
+同时修复 `update_mouse_attachment`（lift carry）：由 `w=1.0` 改为 `w=0.0` 才是真正的 kinematic hold。
+
+### 修复后 headless 结果（filter=none，2026-06-05）
+
+```
+mouse dyn [pinch s225]: X-span=54.0mm  ← 修复前 43.0mm（冻结）
+mouse dyn [pinch s270]: X-span=55.2mm  ← FEM 被挤压向两侧鼓出
+mouse dyn [pinch s285]: X-span=59.7mm  ← 接触冲击，之后回弹
+squeeze_done:           X-span=52mm    ← 稳定压缩态
+grasp confirmed at step 528: mouse z = +0.045 m ✓
+```
+
+FEM 节点在 pinch 期间真实形变，接触力正常传入 FEM 求解器。
+
+### 修复后 GUI 现象（部分仍待解决）
+
+| 现象 | 分析 |
+|------|------|
+| **视觉 mesh 崩飞** | FEM 正常；render mesh 蒙皮在快速形变时失效（Fabric 显示问题） |
+| **绿色 collider 视觉穿模** | render mesh ≠ collision mesh；`filter=none` 下物理碰撞仍开启 |
+| **命令 14 mm，实际 ~23 mm** | 位置 PD + 接触力上限；软体反推后关节达不到命令目标 |
+
+---
+
+## Step 7 — 躯干截面对中 + 手动调参（2026-06-05）
+
+### 背景
+
+小鼠身体在 X 方向呈香蕉形弯曲（头部/臀部 X 中心不同）。用全体节点或整体躯干 bbox 算 X 中心会把夹取点拉偏，导致 GUI 中左指先碰。
+
+### 算法 `get_body_grip_center()`
+
+1. 按 Y 切片，保留 X 宽度 ≥ 45% 最大宽度的切片（排除尾巴）。
+2. `grasp_y = body_lo + GRASP_BODY_Y_FRAC × (body_hi - body_lo)`。
+3. `grip_x` = 在 `grasp_y ± 12 mm` 窄带内节点 X bbox 中点 + `GRASP_BODY_X_OFFSET_M`。
+
+HOVER 验证（无接触）：`finger_mid` vs `body_X@graspY_mid` 误差 **≤ 0.1 mm**。
+
+### 当前手动调优值
+
+```
+GRASP_BODY_Y_FRAC     = 0.4      # 腹肋区（0=尾，1=头）
+GRASP_BODY_X_OFFSET_M = -0.0024  # −2.4 mm
+GRIPPER_CLAMP_M       = 0.007    # 命令总开口 14 mm
+DEFAULT_FINGER_MAX_FORCE_N = 120
+```
+
+### 仍未解决
+
+- GUI 视觉 mesh 崩飞
+- Lift 为 FEM nodal attachment，**非摩擦抓取**
+- 实际 pinch 开度常高于命令目标（接触平衡）
+
+---
+
+## 已知限制（当前版本）
+
+1. **Pinch**：FEM 接触驱动形变 ✓（headless 可验证 X-span 变化）。
+2. **Lift**：`attach_mouse_to_hand` 节点刚性跟随 ✗ 非摩擦力。
+3. **显示**：白色 render mesh 可能在 GUI 崩飞；以 FEM 日志为准。
+4. **开度**：`GRIPPER_CLAMP_M` 为命令值，实际 `f1+f2` 可能更大。
+
+---
+
+## 常量（2026-06-05）
+
+```
+GRIPPER_CLAMP_M          = 0.007  → 14 mm 总开口命令
+GRIPPER_OPEN_M           = 0.04   → 80 mm 全开
+GRASP_BODY_Y_FRAC        = 0.4
+GRASP_BODY_X_OFFSET_M    = -0.0024
+DEFAULT_DEFORM_CONTACT   = 2 mm
+DEFAULT_FINGER_CONTACT   = 1 mm
+DEFAULT_FINGER_KP        = 800
+DEFAULT_FINGER_MAX_FORCE = 120 N
+YOUNG_MODULUS            = 1e4 Pa
+DEFORMABLE_FRICTION      = 0.2
+TABLE_PIN_ENABLED        = False
+Tuned 2+1 mm + none      ≈ 22–25 mm 实际 pinch（命令 14 mm）
+Lift delta (4c)          ≥ +0.045 m → grasp confirmed（attachment）
 ```

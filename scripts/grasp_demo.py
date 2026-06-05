@@ -61,9 +61,9 @@ ARM_OVER_MOUSE_DEG = (25.0, -40.0, -15.0, -95.0, 10.0, 60.0, 30.0)
 ARM_LIFT_DEG = (22.0, -48.0, -12.0, -102.0, 10.0, 78.0, 28.0)
 # Standard Franka finger convention: 0.0 = fully closed, 0.04 = fully open (40 mm each side).
 GRIPPER_OPEN_M = 0.04    # fingers wide open (80 mm total) — used during approach & straddle
-# Fixed clamp spacing used for the entire pinch+lift (per finger). 12 mm × 2 = 24 mm total —
-# well below the ~43 mm FEM collision hull so the soft mouse compresses between the pads.
-GRIPPER_CLAMP_M = 0.012
+# Pinch target: 10 mm × 2 = 20 mm total. The torso (excluding tail) grips at ~30 mm, so the
+# fingers must push ~5 mm per side into the body → the soft mouse visibly compresses.
+GRIPPER_CLAMP_M = 0.007  # 14 mm total opening (was 20 mm); tighter for visible FEM deformation
 
 # Table top ~18 cm — matches Factory Franka reach for the soft-block grasp pose.
 TABLE_SCALE = (0.22, 0.18, 0.05)
@@ -91,10 +91,13 @@ GRASP_LIFT_DELTA_M = 0.045
 REPLAY_KEY = "R"
 MOUSE_ROOT = "/World/MouseAsset"
 
-# Silicone-like deformable material (Pa).
-YOUNG_MODULUS = 5.0e4
+# Silicone-like deformable material (Pa). 1e4 ≈ soft silicone/tissue proxy that visibly
+# compresses under ~80 N finger force; 5e4 was too stiff, 5e3 sagged/tilted during settle.
+YOUNG_MODULUS = 1.0e4
 POISSON_RATIO = 0.48
-DEFORMABLE_FRICTION = 0.8
+# 0.8 anchored the ~33 g mouse to the table (friction ≈ single-finger contact force), so the
+# first finger could not slide the mouse toward the other finger to self-center. 0.2 lets it slide.
+DEFORMABLE_FRICTION = 0.2
 DEFORMABLE_DAMPING = 0.005
 SIM_HEX_RESOLUTION = 8
 MOUSE_GRAVITY_SETTLE_STEPS = 90
@@ -105,17 +108,28 @@ MOUSE_GRAVITY_SETTLE_STEPS = 90
 DEFORMABLE_FLOOR_SINK_M = 0.003  # 3 mm — tune if mouse still floats after rebake
 
 # PhysX collision offsets (physxCollision:* on mesh/collider prims).
-# PhysX default contactOffset is often ~20 mm — can trigger rigid↔deformable coupling
-# before the orange hull geometrically touches (see debug.md Step 4b).
-DEFAULT_DEFORM_CONTACT_OFFSET_M = 0.002   # 2 mm
+# Small contact offsets keep contact at the actual hull surface so finger pressure
+# directly drives FEM node displacement → visible deformation.
+# The "崩飞" is a render artifact (Fabric writeback bug), not a physics blow-up,
+# so large offsets are no longer needed to prevent it.
+DEFAULT_DEFORM_CONTACT_OFFSET_M = 0.002  # 2 mm
 DEFAULT_DEFORM_REST_OFFSET_M = 0.0
 DEFAULT_FINGER_CONTACT_OFFSET_M = 0.001  # 1 mm
 DEFAULT_FINGER_REST_OFFSET_M = 0.0
-DEFAULT_FINGER_KP = 2000.0   # match USD linear drive — higher values eject gripper at deformable contact
+DEFAULT_FINGER_KP = 800.0    # low stiffness prevents ejection when finger meets deformable contact
 DEFAULT_FINGER_KD = 100.0
-DEFAULT_FINGER_MAX_FORCE_N = 8000.0
+DEFAULT_FINGER_MAX_FORCE_N = 120.0  # increased for visible FEM compression (was 80 N)
 GRIPPER_PINCH_CLOSE_CREEP_M = 0.0002  # max per-finger close step per frame when blocked (0.2 mm)
-PINCH_AUTO_MOUSE_FILTER = True  # filter=none: disable gripper↔mouse GPU contact during pinch (prevents ejection)
+PINCH_AUTO_MOUSE_FILTER = False  # filter=none: keep gripper↔mouse contact live (real squeeze + deformation); ejection handled by low PD + soft close
+# Kinematic-pin the mouse to the table during approach/descend.
+# NOTE (2026-06-04, corrected): the 4th kinematic-target component convention is
+# w=0 -> kinematic (pinned), w=1 -> free (PhysX / Isaac Lab). Earlier code had it
+# inverted, so writing w=0 (intending "free") actually pinned every node, leaving the
+# body a frozen static collider through pinch — this was the true cause of the Step 5
+# "FEM never deforms / rigid bodies can't push it laterally" finding (NOT a PhysX
+# limitation). With the flag fixed, the mouse rests on the table by real contact and
+# the gripper can genuinely compress/move it, so we leave the table pin disabled.
+TABLE_PIN_ENABLED = False
 
 # Physics steps between key poses (@ 60 Hz).
 STEPS_APPROACH = 120   # home → hover above mouse (gripper open)
@@ -173,11 +187,34 @@ GRASP_HOVER_Z_OFFSET_M = GRASP_TCP_OFFSET_M + 0.12
 GRASP_STRADDLE_Z_OFFSET_M = GRASP_TCP_OFFSET_M
 GRASP_LIFT_Z_OFFSET_M = GRASP_TCP_OFFSET_M + 0.12
 
+# Body-centred grip target (uniform-density approximation).
+#
+# The raw FEM centroid is biased because node density ≠ mass density: the tail is a
+# long thin appendage that contributes many Y-outlier nodes but very little volume.
+# Treating the mouse as uniform density ⟹ geometric centre of the BODY (no tail).
+#
+# Algorithm (get_body_grip_center):
+#   1. Slice nodes into GRASP_BODY_N_SLICES bins along Y.
+#   2. Keep slices whose local X-width ≥ GRASP_BODY_XWIDTH_THRESHOLD × max X-width.
+#      The body cross-section is wide; the tail is ≲10 % of body width → excluded.
+#   3. Grip X = midpoint of ALL nodes' X bbox (symmetric finger gap, body shape irrelevant).
+#   4. Grip Y = midpoint of "body" Y range (uniform-density body centre).
+#   5. GRASP_BODY_Y_OFFSET_M: signed fine-tune (+ toward head / larger Y).
+GRASP_BODY_N_SLICES         = 16     # Y-bins for X-width sampling (body vs tail)
+GRASP_BODY_XWIDTH_THRESHOLD = 0.45   # body = slices with X-width ≥ 45 % of max body width
+# Grasp Y position WITHIN the body span (0.0 = tail end of body, 1.0 = head end).
+# 0.5 = mid-body; lower toward 0.35-0.45 targets the abdomen/rib area behind the thorax.
+GRASP_BODY_Y_FRAC           = 0.4
+GRASP_BODY_YBAND_M          = 0.012  # ± half-width (m) of the Y band used to measure the grip X-centre
+GRASP_BODY_X_OFFSET_M       = -0.0024    # fine-tune X offset (m); + shifts grip right, - shifts left
+GRASP_BODY_Y_OFFSET_M       = 0.0    # fine-tune Y offset (m); + toward head, - toward tail
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Mouse soft-body grasp demo in Isaac Sim.")
     parser.add_argument("--headless", action="store_true", help="Run without GUI.")
     parser.add_argument(
+
         "--duration",
         type=float,
         default=0.0,
@@ -233,6 +270,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="At pinch end: print detailed blocker report (geometry, efforts, hand contact) "
         "then exit without lift. Run with each --collision-filter mode to isolate the blocker.",
+    )
+    parser.add_argument(
+        "--push-test",
+        action="store_true",
+        help="Diagnostic: spawn a kinematic rigid block and push it into the free deformable "
+        "mouse instead of running the Franka grasp. Determines whether kinematic-rigid → FEM "
+        "contact transmits force (vs Franka-articulation → FEM which appears not to).",
     )
     parser.add_argument(
         "--mouse-mode",
@@ -856,6 +900,83 @@ def get_mouse_world_pos(deformable, stage=None, *, mouse_mode: str = "deformable
     return float(pos[0]), float(pos[1]), float(pos[2])
 
 
+def get_body_grip_center(
+    deformable,
+    fallback: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Return grip target (X, Y, Z) centred on the mouse body at the grasp location.
+
+    The mouse body is banana-curved in X (head leans one way, hips the other), so the
+    X centre depends on Y.  We therefore:
+
+    1. Identify the "body" Y span (wide Y-slices; the thin tail is excluded by the
+       GRASP_BODY_XWIDTH_THRESHOLD filter).
+    2. Pick the grasp Y = body_y_min + GRASP_BODY_Y_FRAC × body_span (+ Y offset).
+    3. Measure grip X = X bounding-box midpoint of ONLY the nodes within a
+       ±GRASP_BODY_YBAND_M band around the grasp Y.  This puts the finger midline on
+       the body's true centre AT the grasp slice (not the whole-body average, which the
+       curved head would bias).
+
+    GRASP_BODY_X_OFFSET_M / GRASP_BODY_Y_OFFSET_M add signed fine-tune offsets.
+    Falls back to ``fallback`` on any error.
+    """
+    import numpy as np
+
+    try:
+        view = deformable._deformable_prim_view
+        if not view.is_physics_handle_valid():
+            return fallback
+        nodes = view.get_simulation_mesh_nodal_positions()
+        if hasattr(nodes, "detach"):
+            nodes = nodes.detach().cpu().numpy()
+        nodes = np.asarray(nodes).reshape(-1, 3)
+        if nodes.shape[0] < 8:
+            return fallback
+
+        # 1. Body Y span: keep "wide" slices (torso), drop the thin tail.
+        y_min = float(nodes[:, 1].min())
+        y_max = float(nodes[:, 1].max())
+        edges = np.linspace(y_min, y_max, GRASP_BODY_N_SLICES + 1)
+        body_y: list[float] = []
+        xwidths: list[float] = []
+        for i in range(GRASP_BODY_N_SLICES):
+            mask = (nodes[:, 1] >= edges[i]) & (nodes[:, 1] < edges[i + 1])
+            if mask.sum() < 2:
+                continue
+            xwidths.append(float(nodes[mask, 0].max() - nodes[mask, 0].min()))
+            body_y.append(float((edges[i] + edges[i + 1]) * 0.5))
+
+        if not xwidths:
+            x_mid = (float(nodes[:, 0].min()) + float(nodes[:, 0].max())) * 0.5
+            return (x_mid + GRASP_BODY_X_OFFSET_M,
+                    float(nodes[:, 1].mean()) + GRASP_BODY_Y_OFFSET_M,
+                    float(nodes[:, 2].mean()))
+
+        threshold = max(xwidths) * GRASP_BODY_XWIDTH_THRESHOLD
+        wide_y = [y for y, w in zip(body_y, xwidths) if w >= threshold]
+        if len(wide_y) >= 2:
+            body_lo, body_hi = min(wide_y), max(wide_y)
+        else:
+            body_lo, body_hi = y_min, y_max
+
+        # 2. Grasp Y inside the body span.
+        grasp_y = body_lo + GRASP_BODY_Y_FRAC * (body_hi - body_lo) + GRASP_BODY_Y_OFFSET_M
+
+        # 3. Grip X = X bbox midpoint of nodes in a Y band around grasp_y.
+        band = (nodes[:, 1] >= grasp_y - GRASP_BODY_YBAND_M) & (nodes[:, 1] <= grasp_y + GRASP_BODY_YBAND_M)
+        if band.sum() >= 4:
+            bx = nodes[band, 0]
+        else:  # widen if the band is too sparse
+            order = np.argsort(np.abs(nodes[:, 1] - grasp_y))
+            bx = nodes[order[: max(8, nodes.shape[0] // 8)], 0]
+        x_mid = (float(bx.min()) + float(bx.max())) * 0.5 + GRASP_BODY_X_OFFSET_M
+
+        z = float(nodes[:, 2].mean())
+        return (x_mid, grasp_y, z)
+    except Exception:
+        return fallback
+
+
 def log_mouse_placement(deformable, label: str) -> None:
     import numpy as np
 
@@ -868,6 +989,23 @@ def log_mouse_placement(deformable, label: str) -> None:
                 nodes = nodes.detach().cpu().numpy()
             nodes = np.asarray(nodes).reshape(-1, 3)
             ext = nodes.max(axis=0) - nodes.min(axis=0)
+            # Torso grip width: X-extent of nodes in the central Y band (excludes the tail
+            # which sticks out in Y/X and inflates the full bounding box).
+            cy = float(nodes[:, 1].mean())
+            band = nodes[np.abs(nodes[:, 1] - cy) <= 0.015]
+            if band.shape[0] >= 8:
+                bx = band[:, 0]
+                full_w = float(bx.max() - bx.min()) * 1000.0
+                p5, p95 = np.percentile(bx, [5, 95])
+                pct_w = float(p95 - p5) * 1000.0
+                print(
+                    f"[grasp_demo] {label}: center=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}), "
+                    f"nodal ext xyz=({ext[0]:.3f}, {ext[1]:.3f}, {ext[2]:.3f}) m, "
+                    f"above_table={pos[2] - TABLE_TOP_Z:.3f} m | "
+                    f"torso grip width X (central Y±15mm): full={full_w:.1f} mm, 5-95%={pct_w:.1f} mm",
+                    flush=True,
+                )
+                return
             print(
                 f"[grasp_demo] {label}: center=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}), "
                 f"nodal ext xyz=({ext[0]:.3f}, {ext[1]:.3f}, {ext[2]:.3f}) m, "
@@ -878,6 +1016,32 @@ def log_mouse_placement(deformable, label: str) -> None:
     except Exception:
         pass
     print(f"[grasp_demo] {label}: center=({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})", flush=True)
+
+
+def log_mouse_dynamics(deformable, label: str) -> None:
+    """Print mouse centroid + X spread so we can tell if the FEM is frozen (pinned)
+    vs actually sliding/deforming during pinch."""
+    if deformable is None:
+        return
+    import numpy as np
+
+    view = deformable._deformable_prim_view
+    try:
+        if not view.is_physics_handle_valid():
+            return
+        nodes = view.get_simulation_mesh_nodal_positions()
+        if hasattr(nodes, "detach"):
+            nodes = nodes.detach().cpu().numpy()
+        nodes = np.asarray(nodes).reshape(-1, 3)
+        c = nodes.mean(axis=0)
+        xspan = float(nodes[:, 0].max() - nodes[:, 0].min()) * 1000.0
+        print(
+            f"[grasp_demo] mouse dyn [{label}]: centroid=({c[0]:.4f}, {c[1]:.4f}, {c[2]:.4f}) "
+            f"X-span={xspan:.1f}mm xmin={nodes[:,0].min():.4f} xmax={nodes[:,0].max():.4f}",
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 def check_grasp_success(
@@ -1116,6 +1280,19 @@ def zero_deformable_velocities(deformable) -> None:
         count = np.asarray(nodes).reshape(-1, 3).shape[0]
     zeros = torch.zeros((1, count, 3), dtype=torch.float32, device=view._device)
     view.set_simulation_mesh_nodal_velocities(zeros)
+
+
+def wake_deformable(deformable) -> None:
+    """Re-write the FEM nodal velocities each frame to reset the sleep timer.
+
+    Belt-and-suspenders alongside ``sleep_threshold=0``: a write to the velocity
+    buffer forces PhysX to treat the body as active so weak gripper contact can
+    actually push/deform it instead of being ignored on a sleeping body."""
+    view = deformable._deformable_prim_view
+    if not view.is_physics_handle_valid():
+        return
+    vel = view.get_simulation_mesh_nodal_velocities(clone=True)
+    view.set_simulation_mesh_nodal_velocities(vel)
 
 
 def get_display_mesh_contact_z(stage, mesh_path: str) -> tuple[float, float]:
@@ -1883,8 +2060,20 @@ def _physics_bottom_z(deformable) -> float:
 
 
 def set_mouse_kinematic_pin(deformable, enabled: bool, *, positions=None) -> None:
-    """Pin FEM nodes (w=1 in 4th component). Use cached ``positions`` to avoid re-teleport jitter."""
+    """Pin/free FEM nodes via the 4th kinematic-target component.
+
+    PhysX/Isaac Lab convention: w=0.0 = kinematically driven (pinned), w=1.0 = free.
+    (We previously had this inverted, which silently pinned every node with w=0 during
+    approach/descend/pinch and made the body look like a frozen static collider — the
+    real cause of the "FEM never deforms / rigid bodies can't push it" Step 5 result.)
+    Use cached ``positions`` to avoid re-teleport jitter.
+    """
     import torch
+
+    # Global kill-switch: never hold the mouse kinematically. Let it rest on the table
+    # by real contact so the gripper can compress/move it during pinch.
+    if not TABLE_PIN_ENABLED:
+        enabled = False
 
     view = deformable._deformable_prim_view
     if not view.is_physics_handle_valid():
@@ -1900,7 +2089,8 @@ def set_mouse_kinematic_pin(deformable, enabled: bool, *, positions=None) -> Non
         pos = pos.unsqueeze(0)
     targets = torch.zeros((pos.shape[0], pos.shape[1], 4), dtype=torch.float32, device=view._device)
     targets[..., :3] = pos[..., :3]
-    targets[..., 3] = 1.0 if enabled else 0.0
+    # w=0 -> kinematic (pinned), w=1 -> free (PhysX/Isaac Lab convention).
+    targets[..., 3] = 0.0 if enabled else 1.0
     view.set_simulation_mesh_kinematic_targets(targets)
 
 
@@ -1943,7 +2133,14 @@ def attach_mouse_to_hand(deformable, grip_center: tuple[float, float, float]) ->
 
 
 def update_mouse_attachment(deformable, grip_center: tuple[float, float, float]) -> None:
-    """Translate the FEM mesh with the grip center during lift (kinematic pin, GUI-visible)."""
+    """Rigidly carry the FEM mesh with the grip center during lift.
+
+    Call this BEFORE ``world.step()`` so the solver sees the kinematic targets
+    for the current step and locks the nodes in place (w=1 = kinematic).  Post-step
+    ``set_simulation_mesh_nodal_positions`` only works in headless mode; in GUI mode
+    the physics-to-Fabric sync that happens inside world.step(render=True) means a
+    post-step write gets overridden by gravity on the next step.
+    """
     import numpy as np
     import torch
 
@@ -1955,14 +2152,16 @@ def update_mouse_attachment(deformable, grip_center: tuple[float, float, float])
 
     delta = np.asarray(grip_center, dtype=np.float64) - np.asarray(_grasp_attach_grip_center, dtype=np.float64)
     new_pos = _grasp_attach_rest_pos + delta
-    pos_t = torch.as_tensor(new_pos, dtype=torch.float32, device=view._device)
-    if pos_t.dim() == 2:
-        pos_t = pos_t.unsqueeze(0)
+    pos_t = torch.as_tensor(new_pos.reshape(1, -1, 3), dtype=torch.float32, device=view._device)
+
+    # Set nodal positions (teleport) AND kinematic targets (lock w=0 = kinematic) together
+    # so the solver both starts at the right position and holds the grabbed nodes kinematic
+    # this step. (w=0 = kinematic, w=1 = free — PhysX/Isaac Lab convention.)
+    view.set_simulation_mesh_nodal_positions(pos_t)
     targets = torch.zeros((pos_t.shape[0], pos_t.shape[1], 4), dtype=torch.float32, device=view._device)
     targets[..., :3] = pos_t
-    targets[..., 3] = 1.0
+    targets[..., 3] = 0.0
     view.set_simulation_mesh_kinematic_targets(targets)
-    zero_deformable_velocities(deformable)
 
 
 def enable_pinch_mouse_filter(stage, collision_path: str, filter_mode: str) -> None:
@@ -2332,7 +2531,7 @@ def align_deformable_mouse_on_table(deformable, *, quiet: bool = False) -> tuple
 
 def add_kinematic_table(stage) -> None:
     """Static table slab — matches soft-block grasp workcell height."""
-    from pxr import Gf, Sdf, UsdGeom, UsdPhysics
+    from pxr import Gf, Sdf, UsdGeom, UsdPhysics, UsdShade
 
     root_path = Sdf.Path("/World/DemoTable")
     UsdGeom.Xform.Define(stage, root_path)
@@ -2345,6 +2544,17 @@ def add_kinematic_table(stage) -> None:
     cube = UsdGeom.Cube.Define(stage, cube_path)
     cube.CreateSizeAttr(1.0)
     UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+
+    # Near-frictionless physics material so the first finger can slide the mouse to self-center.
+    mat_path = root_path.AppendChild("SlipperyMaterial")
+    mat = UsdShade.Material.Define(stage, mat_path)
+    phys_mat = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
+    phys_mat.CreateStaticFrictionAttr(0.0)
+    phys_mat.CreateDynamicFrictionAttr(0.0)
+    phys_mat.CreateRestitutionAttr(0.0)
+    UsdShade.MaterialBindingAPI.Apply(cube.GetPrim()).Bind(
+        mat, bindingStrength=UsdShade.Tokens.weakerThanDescendants, materialPurpose="physics"
+    )
 
     rb = UsdPhysics.RigidBodyAPI.Apply(stage.GetPrimAtPath(root_path))
     rb.CreateRigidBodyEnabledAttr(True)
@@ -2689,6 +2899,78 @@ def print_hand_pose(stage, robot, hand_view, label: str) -> None:
     print(f"[grasp_demo] {label}: panda_hand world pos = ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}) [usd]", flush=True)
 
 
+def create_finger_link_views():
+    """Rigid-body views for hand + both fingers (physics-truth world poses).
+
+    These transforms are what the green collision-debug meshes follow. If the
+    user sees the visual hand fly while these stay sane, the ejection is a
+    render/Fabric decoupling — not a physics blow-up.
+    """
+    from isaacsim.core.simulation_manager import SimulationManager
+
+    sim = SimulationManager.get_physics_sim_view()
+    if sim is None:
+        import omni.physics.tensors as physics_tensors
+
+        sim = physics_tensors.create_simulation_view("torch")
+    views = {}
+    for name, path in (
+        ("hand", HAND_LINK),
+        ("Lfinger", LEFT_FINGER_LINK),
+        ("Rfinger", RIGHT_FINGER_LINK),
+    ):
+        try:
+            views[name] = sim.create_rigid_body_view(path)
+        except Exception:
+            views[name] = None
+    return views
+
+
+def _usd_world_pos(stage, path):
+    from pxr import Usd, UsdGeom
+
+    prim = stage.GetPrimAtPath(path)
+    if not prim.IsValid():
+        return None
+    t = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
+    return (float(t[0]), float(t[1]), float(t[2]))
+
+
+def log_link_render_vs_physics(stage, link_views, label: str) -> None:
+    """Compare each link's physics pose (rigid body view) vs USD render pose.
+
+    A large phys↔usd delta = the render mesh has decoupled from the physics body
+    (the visual "崩飞" with green colliders staying put).
+    """
+    if link_views is None:
+        return
+    import numpy as np
+
+    parts = []
+    for name in ("hand", "Lfinger", "Rfinger"):
+        view = link_views.get(name)
+        phys = None
+        if view is not None:
+            try:
+                phys = view.get_transforms()[0].detach().cpu().numpy()[:3]
+            except Exception:
+                phys = None
+        path = {"hand": HAND_LINK, "Lfinger": LEFT_FINGER_LINK, "Rfinger": RIGHT_FINGER_LINK}[name]
+        usd = _usd_world_pos(stage, path)
+        if phys is None:
+            parts.append(f"{name}: phys=NA")
+            continue
+        if usd is None:
+            parts.append(f"{name}: phys=({phys[0]:.3f},{phys[1]:.3f},{phys[2]:.3f}) usd=NA")
+            continue
+        d = math.dist(phys.tolist(), list(usd))
+        parts.append(
+            f"{name}: phys=({phys[0]:.3f},{phys[1]:.3f},{phys[2]:.3f}) "
+            f"usd=({usd[0]:.3f},{usd[1]:.3f},{usd[2]:.3f}) |Δ|={d*1000:.1f}mm"
+        )
+    print(f"[grasp_demo] link pose [{label}]: " + " | ".join(parts), flush=True)
+
+
 def build_scene(
     app,
     mouse_usd: Path,
@@ -2808,7 +3090,11 @@ def build_scene(
             self_collision=False,
             collision_simplification=False,
             vertex_velocity_damping=0.2,
-            sleep_threshold=0.005,
+            # Never sleep. A free FEM body resting on the table otherwise goes to
+            # sleep; the weak rigid-finger<->FEM contact force stays below the wake
+            # threshold, so the pinned-then-released mouse stays frozen to machine
+            # precision and fingers ghost straight through it without deforming it.
+            sleep_threshold=0.0,
             solver_position_iteration_count=16,
         )
         world.scene.add(deformable)
@@ -3028,7 +3314,17 @@ def run_demo_sequence(
         )
     if deformable is not None:
         log_mouse_placement(deformable, "mouse placement")
+        mouse_now0 = get_mouse_world_pos(deformable, world.stage, mouse_mode=mouse_mode)
+        body_c = get_body_grip_center(deformable, mouse_now0)
+        print(
+            f"[grasp_demo] body grip center: X={body_c[0]*1000:.1f} mm  Y={body_c[1]*1000:.1f} mm"
+            f"  (FEM centroid X={mouse_now0[0]*1000:.1f} mm  Y={mouse_now0[1]*1000:.1f} mm)"
+            f"  xwidth_thresh={GRASP_BODY_XWIDTH_THRESHOLD*100:.0f}%"
+            f"  Y_offset={GRASP_BODY_Y_OFFSET_M*1000:+.1f} mm",
+            flush=True,
+        )
     print_hand_pose(world.stage, robot, hand_view, "after init")
+    link_views = create_finger_link_views()
 
     pin_released = False
     clear_mouse_attachment(deformable)
@@ -3051,7 +3347,14 @@ def run_demo_sequence(
 
     while phase != "done" and step < MAX_GRASP_STEPS:
         mouse_now = get_mouse_world_pos(deformable, world.stage, mouse_mode=mouse_mode)
-        target_xy = (mouse_now[0], mouse_now[1])
+        # Use torso-centered grip XY (X bounding-box midpoint for symmetric finger gap;
+        # Y torso-band midpoint to grip at abdomen/rib area rather than tail).
+        # Falls back to raw centroid for rigid-box mode or if nodes unavailable.
+        if deformable is not None and mouse_mode == "deformable":
+            grip_center = get_body_grip_center(deformable, mouse_now)
+        else:
+            grip_center = mouse_now
+        target_xy = (grip_center[0], grip_center[1])
         hover_z = mouse_now[2] + GRASP_HOVER_Z_OFFSET_M
         straddle_z = mouse_now[2] + GRASP_STRADDLE_Z_OFFSET_M
         force_grip = False
@@ -3061,6 +3364,33 @@ def run_demo_sequence(
             gripper_m = GRIPPER_OPEN_M
             if step >= STEPS_APPROACH:
                 phase = "descend"
+                # Alignment BEFORE descent (mouse at rest, no contact yet).
+                try:
+                    lv = link_views.get("Lfinger") if link_views else None
+                    rv = link_views.get("Rfinger") if link_views else None
+                    lx = float(lv.get_transforms()[0].detach().cpu().numpy()[0]) if lv else float("nan")
+                    rx = float(rv.get_transforms()[0].detach().cpu().numpy()[0]) if rv else float("nan")
+                    import numpy as _np
+                    _v = deformable._deformable_prim_view
+                    _n = _v.get_simulation_mesh_nodal_positions()
+                    if hasattr(_n, "detach"):
+                        _n = _n.detach().cpu().numpy()
+                    _n = _np.asarray(_n).reshape(-1, 3)
+                    fmid = (lx + rx) * 0.5
+                    gc = get_body_grip_center(deformable, (target_xy[0], target_xy[1], 0.0))
+                    # X-center of the body AT the chosen grasp Y band (what we want fingers on).
+                    band = (_n[:, 1] >= gc[1] - GRASP_BODY_YBAND_M) & (_n[:, 1] <= gc[1] + GRASP_BODY_YBAND_M)
+                    bx = _n[band, 0]
+                    bxc = (float(bx.min()) + float(bx.max())) * 0.5 if band.sum() >= 2 else float("nan")
+                    print(
+                        f"[grasp_demo] HOVER align: finger_mid_X={fmid*1000:.1f} | grip_target_X={gc[0]*1000:.1f} | "
+                        f"grasp_Y={gc[1]*1000:.1f} | body_X@graspY_mid={bxc*1000:.1f} "
+                        f"(width={(float(bx.max())-float(bx.min()))*1000:.1f}) | "
+                        f"finger vs body-center {(fmid-bxc)*1000:+.1f} mm",
+                        flush=True,
+                    )
+                except Exception as _e:
+                    print(f"[grasp_demo] HOVER X-align failed: {_e}", flush=True)
         elif phase == "descend":
             t = (step - STEPS_APPROACH) / max(1, STEPS_DESCEND - STEPS_APPROACH)
             target_xyz = (target_xy[0], target_xy[1], hover_z + (straddle_z - hover_z) * t)
@@ -3072,6 +3402,26 @@ def run_demo_sequence(
                 pinch_hold_start = None
                 opening_history.clear()
                 compliant_cmd_m = GRIPPER_OPEN_M
+                # Log alignment: torso grip centre vs live finger positions at straddle.
+                try:
+                    lv = link_views.get("Lfinger") if link_views else None
+                    rv = link_views.get("Rfinger") if link_views else None
+                    lx = float(lv.get_transforms()[0].detach().cpu().numpy()[0]) if lv else float("nan")
+                    rx = float(rv.get_transforms()[0].detach().cpu().numpy()[0]) if rv else float("nan")
+                    mx = get_mouse_world_pos(deformable, world.stage, mouse_mode=mouse_mode)[0] if deformable else float("nan")
+                    mc = get_body_grip_center(deformable, (mx, target_xy[1], 0.0))[0] if deformable else float("nan")
+                    print(
+                        f"[grasp_demo] straddle X-alignment: "
+                        f"torso_grip={mc*1000:.1f} mm | "
+                        f"finger_mid={(lx+rx)*500:.1f} mm  "
+                        f"(L={lx*1000:.1f}  R={rx*1000:.1f}) | "
+                        f"mouse_centroid={mx*1000:.1f} mm | "
+                        f"L_gap={(lx - (mc + MOUSE_MESH_BODY_WIDTH_M/2))*1000:.1f} mm  "
+                        f"R_gap={((mc - MOUSE_MESH_BODY_WIDTH_M/2) - rx)*1000:.1f} mm",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
                 if pinch_mode == "position":
                     msg = (
                         f"force clamp to {GRIPPER_CLAMP_M * 2000:.0f} mm total, "
@@ -3244,18 +3594,17 @@ def run_demo_sequence(
         if deformable is not None:
             if phase in ("approach", "descend"):
                 refresh_mouse_table_pin(deformable)
+            elif phase == "pinch":
+                if not pin_released:
+                    release_mouse_table_pin(deformable)
+                    pin_released = True
+                # The mouse IS free here (fingers visibly penetrate the FEM hull), but
+                # the body sleeps and weak finger contact can't wake it -> keep it awake
+                # every frame so the gripper can actually push/compress it.
+                wake_deformable(deformable)
             elif not pin_released:
                 release_mouse_table_pin(deformable)
                 pin_released = True
-
-        if phase == "lift" and attachment_done and deformable is not None:
-            hand_pos_l, _ = get_hand_world_pose(hand_view)
-            grip_center = (
-                float(hand_pos_l[0]),
-                float(hand_pos_l[1]),
-                float(hand_pos_l[2]) - GRASP_TCP_OFFSET_M,
-            )
-            update_mouse_attachment(deformable, grip_center)
 
         if step in milestone_steps:
             label = milestone_names[step]
@@ -3315,12 +3664,30 @@ def run_demo_sequence(
                 phase = "done"
                 break
 
+        # Carry the mouse BEFORE world.step() so the solver sees kinematic targets
+        # for THIS step. GUI mode runs world.step(render=True) which syncs Fabric
+        # at the end — a post-step write gets overridden by gravity next frame.
+        if phase == "lift" and attachment_done and deformable is not None:
+            hand_pos_l, _ = get_hand_world_pose(hand_view)
+            grip_center = (
+                float(hand_pos_l[0]),
+                float(hand_pos_l[1]),
+                float(hand_pos_l[2]) - GRASP_TCP_OFFSET_M,
+            )
+            update_mouse_attachment(deformable, grip_center)
+
         world.step(render=not headless)
+
         app.update()
         if debug is not None and deformable is not None:
             debug.update(deformable, mesh_path)
         if gripper_debug is not None and not headless:
             gripper_debug.update(robot)
+
+        if phase in ("pinch", "lift") and step % 15 == 0:
+            log_link_render_vs_physics(world.stage, link_views, f"{phase} s{step}")
+            log_mouse_dynamics(deformable, f"{phase} s{step}")
+
         step += 1
 
         if phase == "lift" and step >= GRASP_CHECK_START:
@@ -3360,6 +3727,114 @@ def export_stage(export_path: Path) -> None:
     print(f"[grasp_demo] exported scene → {export_path}", flush=True)
 
 
+def run_push_test(world, deformable, app, mesh_path: str, headless: bool) -> int:
+    """Kinematic rigid block pushes the free deformable mouse.
+
+    Answers: does kinematic-rigid → FEM contact transmit force?
+    If yes → the Franka articulation is the specific culprit.
+    If no  → rigid contact generally cannot push FEM nodes here.
+    """
+    import numpy as np
+    from pxr import Gf, UsdGeom, UsdPhysics
+
+    PUSH_STEPS          = 300
+    LOG_INTERVAL        = 15
+    PUSH_VEL_M_PER_STEP = 0.0005  # 0.5 mm/frame → ~30 mm/s @ 60 Hz
+    BLOCK_GAP_M         = 0.030   # initial gap left of mouse
+    BW, BD, BH         = 0.012, 0.060, 0.040  # block width/depth/height (m)
+
+    stage = world.stage
+
+    def _get_view():
+        return deformable._deformable_prim_view
+
+    def _get_arr():
+        v   = _get_view()
+        pos = v.get_simulation_mesh_nodal_positions()
+        return pos.detach().cpu().numpy().reshape(-1, 3) if hasattr(pos, "detach") \
+               else np.asarray(pos).reshape(-1, 3)
+
+    def _log(step, label):
+        arr = _get_arr()
+        cx, cy, cz = arr.mean(axis=0)
+        xmin, xmax = float(arr[:, 0].min()), float(arr[:, 0].max())
+        print(f"[push_test] {label} s{step:03d}: "
+              f"centroid=({cx:.4f},{cy:.4f},{cz:.4f}) "
+              f"X-span={(xmax-xmin)*1000:.1f}mm xmin={xmin:.4f} xmax={xmax:.4f}", flush=True)
+        return cx, xmin, xmax
+
+    # Measure settled mouse position (build_scene already settled it)
+    arr0   = _get_arr()
+    xmin0  = float(arr0[:, 0].min())
+    xmax0  = float(arr0[:, 0].max())
+    span0  = xmax0 - xmin0
+    cx0, _, _ = _log(0, "before_push_block")
+
+    # Spawn kinematic push block to the left of the mouse
+    start_x   = xmin0 - BLOCK_GAP_M - BW * 0.5
+    block_path = "/World/PushBlock"
+    block_prim = UsdGeom.Cube.Define(stage, block_path)
+    block_prim.GetSizeAttr().Set(1.0)
+    xf = UsdGeom.Xformable(block_prim.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(start_x, MOUSE_TRANSLATE[1], TABLE_TOP_Z + BH * 0.5))
+    xf.AddScaleOp().Set(Gf.Vec3d(BW, BD, BH))
+    rb = UsdPhysics.RigidBodyAPI.Apply(block_prim.GetPrim())
+    rb.CreateKinematicEnabledAttr(True)
+    UsdPhysics.CollisionAPI.Apply(block_prim.GetPrim())
+    from pxr import PhysxSchema
+    PhysxSchema.PhysxCollisionAPI.Apply(block_prim.GetPrim())
+    co = PhysxSchema.PhysxCollisionAPI(block_prim.GetPrim())
+    co.CreateContactOffsetAttr(0.001)
+    co.CreateRestOffsetAttr(0.0)
+    print(f"[push_test] block spawned at x={start_x:.4f} "
+          f"(gap {BLOCK_GAP_M*1000:.0f} mm left of mouse, start_x→{start_x:.4f}, "
+          f"mouse xmin={xmin0:.4f})", flush=True)
+
+    # Warm up a few frames so PhysX registers the new block prim
+    for _ in range(30):
+        world.step(render=not headless)
+        app.update()
+    _log(0, "pre_push")
+
+    def _move(step):
+        new_x = start_x + step * PUSH_VEL_M_PER_STEP
+        prim = stage.GetPrimAtPath(block_path)
+        xf2  = UsdGeom.Xformable(prim)
+        xf2.ClearXformOpOrder()
+        xf2.AddTranslateOp().Set(Gf.Vec3d(new_x, MOUSE_TRANSLATE[1], TABLE_TOP_Z + BH * 0.5))
+        xf2.AddScaleOp().Set(Gf.Vec3d(BW, BD, BH))
+
+    print(f"[push_test] pushing {PUSH_STEPS} steps "
+          f"({PUSH_VEL_M_PER_STEP*1000:.1f} mm/step) …", flush=True)
+    for step in range(1, PUSH_STEPS + 1):
+        _move(step)
+        world.step(render=not headless)
+        app.update()
+        if step % LOG_INTERVAL == 0:
+            _log(step, "push")
+
+    # ── result ────────────────────────────────────────────────────────────────
+    cx_f, xmin_f, xmax_f = _log(PUSH_STEPS, "final")
+    span_f  = xmax_f - xmin_f
+    d_cx    = (cx_f - cx0)  * 1000.0
+    d_span  = (span_f - span0) * 1000.0
+    block_x = start_x + PUSH_STEPS * PUSH_VEL_M_PER_STEP
+    print("\n[push_test] ═══ RESULT ═══", flush=True)
+    print(f"  centroid X shift : {d_cx:+.3f} mm  (+→ pushed right)", flush=True)
+    print(f"  X-span change    : {d_span:+.3f} mm  (−→ compressed)", flush=True)
+    print(f"  block final X    : {block_x:.4f}  (mouse xmin was {xmin0:.4f})", flush=True)
+    if abs(d_cx) > 0.5 or abs(d_span) > 0.5:
+        print("  ✓ FEM responded to kinematic-rigid contact", flush=True)
+        print("    → Franka articulation is the specific culprit", flush=True)
+        print("    → Fix: PhysX Attachment API when fingers reach target", flush=True)
+    else:
+        print("  ✗ FEM did NOT respond — rigid contact generally cannot push FEM", flush=True)
+        print("    → Must drive FEM nodes directly (attachment / kinematic-node)", flush=True)
+    print("[push_test] ═══════════════\n", flush=True)
+    return 0
+
+
 def main() -> int:
     if not os.environ.get("OMNI_KIT_ACCEPT_EULA"):
         os.environ["OMNI_KIT_ACCEPT_EULA"] = "YES"
@@ -3395,6 +3870,16 @@ def main() -> int:
             debug.enabled = False
         if args.hide_gripper_debug:
             gripper_debug.enabled = False
+
+        if args.push_test and deformable is not None:
+            # prepare_run does world.reset + play + deformable.initialize + settle on table
+            prepare_run(
+                world, robot, deformable, simulation_app, mesh_path, debug,
+                headless=True, mouse_mode=mouse_mode,
+            )
+            exit_code = run_push_test(world, deformable, simulation_app, mesh_path, args.headless)
+            simulation_app.close()
+            return exit_code
 
         if not args.headless:
             from isaacsim.core.utils.viewports import set_camera_view
