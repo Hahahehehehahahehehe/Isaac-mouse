@@ -1136,6 +1136,35 @@ def set_translate(stage, prim_path: str, xyz: tuple[float, float, float]) -> Non
     xform.AddTranslateOp().Set(Gf.Vec3d(*xyz))
 
 
+def disable_instanceable(stage, root_path: str) -> int:
+    """Flatten instanceable references so the visual render mesh follows physics.
+
+    The FactoryFranka asset references instanceable prototypes. PhysX writes live
+    per-link transforms to Fabric, but with scene-graph instancing OFF the instanced
+    prototype geometry never receives those transforms — the white visual hand/fingers
+    freeze at the authored prototype (joints-zero) pose while the green collider debug
+    (authored as fresh non-instanced prims) tracks physics. That is the GUI "崩飞":
+    the visual gripper detaches from its colliders. Making every prim unique lets the
+    Fabric writeback drive the visual meshes too.
+    """
+    from pxr import Usd
+
+    root = stage.GetPrimAtPath(root_path)
+    if not root or not root.IsValid():
+        return 0
+    count = 0
+    for prim in Usd.PrimRange(root):
+        if prim.IsInstanceable():
+            prim.SetInstanceable(False)
+            count += 1
+    print(
+        f"[grasp_demo] de-instanced {count} prim(s) under {root_path} "
+        "(visual mesh now follows physics via Fabric)",
+        flush=True,
+    )
+    return count
+
+
 def mesh_triangle_indices(mesh) -> "np.ndarray":
     """Triangulate USD mesh faces to (F, 3) vertex indices."""
     import numpy as np
@@ -3021,6 +3050,11 @@ def build_scene(
 
     franka_usd = get_assets_root_path() + FRANKA_USD_REL
     stage_utils.add_reference_to_stage(franka_usd, FRANKA_ROOT)
+    # FactoryFranka ships instanceable prototypes; with omnihydra scene-graph instancing
+    # off, the instanced visual meshes ignore PhysX→Fabric per-link transforms and freeze
+    # at the prototype rest pose (the GUI gripper "崩飞"). Flatten to unique prims so the
+    # white hand/fingers render where physics actually puts them.
+    disable_instanceable(world.stage, FRANKA_ROOT)
 
     usd_context = omni.usd.get_context()
     wait_stage_loaded(usd_context, app)

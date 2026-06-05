@@ -9,17 +9,18 @@ Repository: [github.com/Hahahehehehahahehehe/Isaac-mouse](https://github.com/Hah
 - **Pinch**: gripper closes on a silicone-like FEM mouse with real contact-driven deformation (after kinematic-flag fix, Step 6).
 - **Lift**: mouse rises with the gripper and passes grasp check (`mouse z` delta ≥ 45 mm).
 - **Alignment**: `get_body_grip_center()` places the TCP over the torso at a chosen Y slice and centres X on that slice (handles banana-curved body geometry).
+- **GUI gripper visuals**: white Franka hand/fingers follow physics (Step 8 — `disable_instanceable()` on load).
 
 ## Known limitations (2026-06-05)
 
 | Issue | Status |
 |-------|--------|
-| **Visual mesh “崩飞”** during pinch | FEM sim is OK; white render mesh can explode when nodes move fast (Fabric/skinning artifact). |
+| **Mouse FEM visual jitter** during pinch | FEM sim is OK; mouse white render mesh may still jitter when nodes move fast (skinning artifact). Gripper visuals fixed in Step 8. |
 | **Lift is not friction-based** | Parallel gripper cannot lift soft silicone by friction alone; lift uses **FEM nodal attachment** (`attach_mouse_to_hand` + per-frame `set_simulation_mesh_nodal_positions`). |
 | **Commanded vs actual pinch opening** | Target may be 14 mm total (`GRIPPER_CLAMP_M=0.007`) but physics stalls higher (~20–24 mm) when contact + max finger force balance out. |
-| **GUI vs physics** | Green finger debug colliders and white render mesh can look like penetration; trust FEM logs / headless metrics over visuals alone. |
+| **GUI vs physics (mouse only)** | Mouse render mesh can look like penetration during fast deformation; trust FEM logs / headless metrics for mouse physics. |
 
-See `debug.md` (Steps 0–7) and `HANDOFF.md` for full history and tuning notes.
+See `debug.md` (Steps 0–8) and `HANDOFF.md` for full history and tuning notes.
 
 ## Requirements
 
@@ -74,7 +75,7 @@ prepare_run → approach (hover) → descend (straddle) → pinch (close + squee
 | `scripts/push_test.py` | Diagnostic: kinematic block push vs FEM |
 | `scripts/phase2_*.py` | Mesh prep & USD export |
 | `assets/usd/mouse_soft.usd` | Deformable mouse asset |
-| `debug.md` | Debug log Steps 0–7 |
+| `debug.md` | Debug log Steps 0–8 |
 | `HANDOFF.md` | Session handoff & current status |
 | `plan.md` | Pipeline roadmap |
 

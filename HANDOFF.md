@@ -29,16 +29,17 @@ $py = "D:\Labworks\Project_Issac\.venv-isaacsim\Scripts\python.exe"
 | Lift 时小鼠不抬 | FEM nodal attachment 刚性跟随 gripper（Step 4c） |
 | Pinch 时 FEM 完全不形变 | kinematic flag 写反（`w=0`=pin, `w=1`=free）已修正（Step 6） |
 | 夹取点偏尾 / X 不对称 | `get_body_grip_center()`：按 Y 截面宽度识别躯干，在夹取 Y 窄带内算 X 中心（Step 7） |
+| 夹爪视觉 mesh 与绿色 collider 分离（GUI「崩飞」） | `disable_instanceable()`：加载 Franka 后取消 instanceable 原型（Step 8） |
 
 ---
 
 ## 3. 当前仍存在的问题（2026-06-05）
 
-### A. 视觉 mesh 崩飞（GUI）
+### A. 小鼠 FEM 视觉 mesh 快速形变（GUI，次要）
 
-- **现象**：pinch 时白色 render mesh 顶点爆炸、与绿色 finger collider 视觉穿模。
-- **性质**：FEM 仿真网格通常正常；崩飞多为 render mesh 蒙皮 / Fabric 写回 artifact，不代表物理穿透。
-- **未解决**：需降形变速率、调刚度，或接受 headless 数值验证。
+- **现象**：pinch 时小鼠白色 render mesh 顶点可能剧烈抖动或穿模感；**夹爪视觉已与 collider 同步**（Step 8 已修）。
+- **性质**：FEM 仿真网格通常正常；小鼠 render 崩飞多为蒙皮 / Fabric 写回 artifact，不代表物理穿透。
+- **未解决**：可降形变速率、调刚度，或接受 headless 数值验证。
 
 ### B. 抬起不靠摩擦力
 
@@ -109,7 +110,7 @@ prepare_run → approach → descend → pinch (FEM 接触形变)
 |------|------|
 | `scripts/grasp_demo.py` | 主 demo |
 | `scripts/push_test.py` | kinematic 推块 vs FEM 诊断 |
-| `debug.md` | Step 0–7 实验记录 |
+| `debug.md` | Step 0–8 实验记录 |
 | `README.md` | 快速上手 + 已知限制 |
 | `plan.md` | 管线 roadmap |
 
@@ -117,6 +118,6 @@ prepare_run → approach → descend → pinch (FEM 接触形变)
 
 ## 8. 下一 session 建议方向
 
-1. 减轻 GUI render mesh 崩飞（降力 / 降刚度 / 分阶段闭合）。
+1. 若小鼠 FEM 视觉仍抖动：降力 / 降刚度 / 分阶段闭合。
 2. 评估是否要在 pinch 阶段也做节点驱动形变（仅当接触形变视觉仍不够）。
 3. 若要做「真摩擦抓取」，需换机制（更大摩擦、包裹式夹爪、或 attachment 仅作保底）。

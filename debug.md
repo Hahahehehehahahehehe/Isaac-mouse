@@ -357,9 +357,50 @@ DEFAULT_FINGER_MAX_FORCE_N = 120
 
 ### 仍未解决
 
-- GUI 视觉 mesh 崩飞
+- 小鼠 FEM 视觉 mesh 在 GUI 快速形变时可能抖动（夹爪视觉已修，见 Step 8）
 - Lift 为 FEM nodal attachment，**非摩擦抓取**
 - 实际 pinch 开度常高于命令目标（接触平衡）
+
+---
+
+## Step 8 — 夹爪视觉 mesh 与 collider 分离（2026-06-05，已修复）
+
+### 现象
+
+GUI 中白色 Franka 手/手指视觉 mesh 停在空中（关节零位、z≈0.93 m），与绿色 finger collider 相差 **~700 mm**；绿色 debug collider 正常跟随物理。物理与 headless 抓取流程均正常。
+
+### 根因
+
+FactoryFranka USD 使用 **instanceable 原型**（scene-graph instancing）。PhysX 将每帧 link 变换写入 Fabric，但本 demo 未启用 omnihydra scene-graph instancing。实例化原型上的**视觉几何**收不到 per-instance 变换，冻结在原型 rest 姿态；后建的绿色 `PhysXColliderDebug_*` 为非实例化 prim，能跟 Fabric → 视觉与 collider 分离。
+
+Kit 日志证据：
+
+```
+[Warning] [omni.physx.fabric.plugin] Prototype prims (instancing prototypes) are present
+in the stage but omnihydra scene graph instancing is not enabled!
+```
+
+`log_link_render_vs_physics` 中 `usd=(0.158,0.350,0.926)` 恒定不变，是读 **USD stage 静态 authored 姿态**（非 Fabric 实时渲染），不能单独证明崩飞，但与上述 instancing 问题一致。
+
+### 修复
+
+加载 Franka 后调用 `disable_instanceable(stage, FRANKA_ROOT)`，将子树内 11 个 `instanceable` prim 设为唯一 prim，使 Fabric 写回驱动白色视觉 mesh。
+
+```python
+stage_utils.add_reference_to_stage(franka_usd, FRANKA_ROOT)
+disable_instanceable(world.stage, FRANKA_ROOT)
+```
+
+### 验证
+
+| 检查项 | 结果 |
+|--------|------|
+| 启动日志 | `de-instanced 11 prim(s) under /World/FactoryFranka` |
+| Fabric 警告 | `scene graph instancing is not enabled` **消失** |
+| headless | `grasp confirmed`（step 523，Δz ≥ 45 mm） |
+| GUI | 用户确认：白色夹爪与绿色 collider 同步，视觉「崩飞」消失 ✓ |
+
+- [x] Step 8 完成
 
 ---
 
@@ -367,7 +408,7 @@ DEFAULT_FINGER_MAX_FORCE_N = 120
 
 1. **Pinch**：FEM 接触驱动形变 ✓（headless 可验证 X-span 变化）。
 2. **Lift**：`attach_mouse_to_hand` 节点刚性跟随 ✗ 非摩擦力。
-3. **显示**：白色 render mesh 可能在 GUI 崩飞；以 FEM 日志为准。
+3. **显示**：夹爪视觉 ✓（Step 8）；小鼠白色 render mesh 在快速 pinch 时仍可能抖动，以 FEM 日志为准。
 4. **开度**：`GRIPPER_CLAMP_M` 为命令值，实际 `f1+f2` 可能更大。
 
 ---
