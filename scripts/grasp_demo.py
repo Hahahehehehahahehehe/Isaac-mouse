@@ -48,6 +48,20 @@ HAND_LINK = f"{FRANKA_ROOT}/panda_hand"
 LEFT_FINGER_LINK = f"{FRANKA_ROOT}/panda_leftfinger"
 RIGHT_FINGER_LINK = f"{FRANKA_ROOT}/panda_rightfinger"
 GRIPPER_DEBUG_ROOT = "/World/DebugGripper"
+CAMERAS_ROOT = "/World/DemoCameras"
+WRIST_CAM_PATH = f"{HAND_LINK}/wrist_cam"
+SIDE_CAM_PATH = f"{CAMERAS_ROOT}/SideView"
+# Eye-in-hand on panda_hand (local m). +Z = finger approach, +Y = finger spread.
+# Start from the original between-fingers mount (+Z), nudge −Y, then tilt view slightly out of
+# the hand XOZ plane (Ry>0) so both fingers appear in the lower frame (observation.arm style).
+WRIST_CAM_LOCAL_X_M = -0.10
+WRIST_CAM_LOCAL_Y_M = 0.0
+WRIST_CAM_LOCAL_Z_M = -0.05
+WRIST_CAM_ROT_DEG = (180.0, 30.0, 0.0)  # Rx=180: look along +Z; Ry lifts gaze off XOZ plane
+WRIST_CAM_FOCAL_MM = 18.0
+# Fixed side third-person (m from scene center). Mouse head–tail = +Y; main viewport on +X looking −X.
+DEMO_CAM_SIDE_DIST_M = 1.55
+DEMO_CAM_SIDE_HEIGHT_M = 0.78
 GRIPPER_COLLIDER_COLOR = (0.15, 0.95, 0.25)   # green — PhysX rigid colliders on the gripper
 CONTACT_POINT_COLOR = (1.0, 0.05, 0.05)       # red — live PhysX contact points
 CONTACT_POINT_WIDTH = 0.008
@@ -66,9 +80,19 @@ GRIPPER_OPEN_M = 0.04    # fingers wide open (80 mm total) — used during appro
 GRIPPER_CLAMP_M = 0.007  # 14 mm total opening (was 20 mm); tighter for visible FEM deformation
 
 # Table top ~18 cm — matches Factory Franka reach for the soft-block grasp pose.
-TABLE_SCALE = (0.22, 0.18, 0.05)
+TABLE_TOP_SIZE_XY = (0.22, 0.18)
+TABLE_TOP_THICKNESS_M = 0.05
+TABLE_SCALE = (*TABLE_TOP_SIZE_XY, TABLE_TOP_THICKNESS_M)  # collision top slab (unchanged footprint)
 TABLE_TOP_Z = 0.18
-TABLE_TRANSLATE = (0.52, 0.35, TABLE_TOP_Z - TABLE_SCALE[2] * 0.5)
+TABLE_LEG_SIZE_M = 0.032          # square leg cross-section
+TABLE_LEG_INSET_M = 0.038         # leg center inset from table edge
+TABLE_LEG_HEIGHT_M = TABLE_TOP_Z - TABLE_TOP_THICKNESS_M
+TABLE_CENTER_XY = (0.52, 0.35)
+TABLE_TRANSLATE = (
+    TABLE_CENTER_XY[0],
+    TABLE_CENTER_XY[1],
+    TABLE_TOP_Z - TABLE_TOP_THICKNESS_M * 0.5,
+)
 
 # Mouse mesh bounds (see assets/usd/phase2_mesh_report.json): head-tail ~Y (0.08 m), width ~X (0.042 m).
 MOUSE_MESH_HALF_HEIGHT_M = 0.012567
@@ -87,10 +111,12 @@ GRASP_HAND_HEIGHT_TOL_M = 0.08
 ARM_DRIVE_SETTLE_STEPS = 45
 
 # Grasp verification / replay timing (@ 60 Hz).
-# Friction lift: centroid lags finger height when the soft body pitches (head sinks).
-GRASP_LIFT_DELTA_FRICTION_M = 0.012   # 12 mm centroid rise → grasp confirmed
-GRASP_LIFT_DELTA_ATTACHMENT_M = 0.045  # rigid nodal carry lifts the whole mesh
-GRASP_LIFT_DELTA_M = GRASP_LIFT_DELTA_FRICTION_M  # default (friction lift)
+# Centroid Δz threshold for grasp confirmed — aligned with Cartesian lift span
+# (GRASP_LIFT_Z_OFFSET_M − GRASP_STRADDLE_Z_OFFSET_M = 0.12 m).
+GRASP_LIFT_DELTA_CONFIRM_M = 0.12    # 12 cm centroid rise → grasp confirmed
+GRASP_LIFT_DELTA_FRICTION_M = GRASP_LIFT_DELTA_CONFIRM_M
+GRASP_LIFT_DELTA_ATTACHMENT_M = GRASP_LIFT_DELTA_CONFIRM_M
+GRASP_LIFT_DELTA_M = GRASP_LIFT_DELTA_CONFIRM_M
 REPLAY_KEY = "R"
 MOUSE_ROOT = "/World/MouseAsset"
 
@@ -107,7 +133,11 @@ FRICTION_LIFT_GRIP_CREEP_M = 0.0003   # per-frame per-finger close during fricti
 FRICTION_LIFT_GRIP_MIN_M = 0.004      # keep creeping closed until 4 mm/finger (8 mm total)
 LIFT_MODE_FRICTION = "friction"
 LIFT_MODE_ATTACHMENT = "attachment"
+LIFT_MODE_HYBRID = "hybrid"
 DEFAULT_LIFT_MODE = LIFT_MODE_FRICTION
+# Hybrid: partial kinematic on grip-region nodes BEFORE Z lift (no friction-only lift start).
+HYBRID_CONSTRAINT_SETTLE_STEPS = 30  # ~0.5 s @ 60 Hz — arm frozen, constraint on, then lift
+GRASP_LIFT_DELTA_HYBRID_M = GRASP_LIFT_DELTA_CONFIRM_M
 DEFORMABLE_DAMPING = 0.005
 SIM_HEX_RESOLUTION = 8
 MOUSE_GRAVITY_SETTLE_STEPS = 90
@@ -150,7 +180,7 @@ GRIPPER_CLAMP_HOLD_STEPS = 120    # hold forced clamp at straddle height before 
 _PINCH_MAX_STEPS = GRIPPER_CLOSE_STEPS + GRIPPER_SQUEEZE_STEPS + GRIPPER_CLAMP_HOLD_STEPS
 LIFT_DURATION_STEPS = 360  # ~6 s @ 60 Hz; arm travel ∝ lift_steps/LIFT_DURATION (linear in t)
 # Must cover descend + full pinch + lift; old fixed 900 capped lift to ~455 frames (see below).
-MAX_GRASP_STEPS = STEPS_DESCEND + _PINCH_MAX_STEPS + LIFT_DURATION_STEPS + 80
+MAX_GRASP_STEPS = STEPS_DESCEND + _PINCH_MAX_STEPS + HYBRID_CONSTRAINT_SETTLE_STEPS + LIFT_DURATION_STEPS + 80
 GRASP_CHECK_START = STEPS_DESCEND + GRIPPER_CLOSE_STEPS + 20
 
 # Step4 force/compliant pinch — keep gripper↔mouse contact (filter=none).
@@ -250,9 +280,9 @@ def parse_args() -> argparse.Namespace:
         help="Also show cyan SimNodes + orange CollisionNodes point clouds (hidden by default).",
     )
     parser.add_argument(
-        "--hide-collision-debug",
+        "--show-collision-debug",
         action="store_true",
-        help="Hide orange collision / cyan FEM debug overlays (visible by default).",
+        help="Show orange collision / cyan FEM debug overlays (off by default).",
     )
     parser.add_argument(
         "--show-gripper-contacts",
@@ -260,9 +290,9 @@ def parse_args() -> argparse.Namespace:
         help="Enable PhysX RigidContactView (red contact points; can be noisy on GPU).",
     )
     parser.add_argument(
-        "--hide-gripper-debug",
+        "--show-gripper-debug",
         action="store_true",
-        help="Hide green gripper colliders + red PhysX contact points (shown by default).",
+        help="Show green gripper colliders + red PhysX contact points (off by default).",
     )
     parser.add_argument(
         "--rebake",
@@ -297,10 +327,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lift-mode",
-        choices=(LIFT_MODE_FRICTION, LIFT_MODE_ATTACHMENT),
+        choices=(LIFT_MODE_FRICTION, LIFT_MODE_ATTACHMENT, LIFT_MODE_HYBRID),
         default=DEFAULT_LIFT_MODE,
         help="Lift strategy: friction=pinch squeeze + high friction (default); "
-        "attachment=legacy FEM nodal kinematic carry.",
+        "hybrid=friction then partial kinematic on grip-region nodes; "
+        "attachment=legacy whole-mesh kinematic carry.",
     )
     parser.add_argument(
         "--mouse-friction",
@@ -321,6 +352,17 @@ def parse_args() -> argparse.Namespace:
         help="Pinch control: position=stiff position ramp (default); "
         "force=effort-mode closing force (Step4, use with --collision-filter none); "
         "compliant=low-gain position creep.",
+    )
+    parser.add_argument(
+        "--no-demo-cameras",
+        action="store_true",
+        help="Skip wrist + fixed side camera and extra GUI viewports.",
+    )
+    parser.add_argument(
+        "--no-extra-viewports",
+        action="store_true",
+        help="Create camera prims + set main view only; skip floating wrist window "
+        "(reduces GPU load / renderer crashes on laptop GPUs).",
     )
     parser.add_argument(
         "--no-contact-offset-tuning",
@@ -907,6 +949,56 @@ def apply_cartesian_ik_step(
     robot._articulation_view.set_joint_position_targets(targets_t)
 
 
+def apply_vertical_cartesian_lift_step(
+    robot,
+    hand_view,
+    target_z: float,
+    hold_xy: tuple[float, float],
+    gripper_m: float,
+    *,
+    target_quat_xyzw: tuple[float, float, float, float] = GRASP_DOWN_QUAT_XYZW,
+    orn_gain: float = 10.0,
+    max_step_m: float = 0.05,
+) -> None:
+    """Lift via damped IK with XY locked and strong top-down orientation hold.
+
+    Used during lift so the pinch vertical pose is preserved while panda_hand
+    tracks ``target_z``. Do not call ``force_gripper_spacing`` after this —
+    that helper overwrites arm *targets* with measured positions and causes tilt.
+    """
+    import numpy as np
+    import torch
+
+    hand_pos, hand_quat = get_hand_world_pose(hand_view)
+    dof_pos = robot.get_joint_positions().detach().cpu().numpy().flatten()
+    j_eef = robot._articulation_view.get_jacobians()[0, 7, :, :7].detach().cpu().numpy()
+
+    pos_err = np.array(
+        [hold_xy[0] - hand_pos[0], hold_xy[1] - hand_pos[1], target_z - hand_pos[2]],
+        dtype=np.float32,
+    )
+    err_mag = float(np.linalg.norm(pos_err)) + 1e-6
+    if err_mag > max_step_m:
+        pos_err *= max_step_m / err_mag
+
+    goal_quat = np.array(target_quat_xyzw, dtype=np.float32)
+    orn_err = orientation_error_xyzw(goal_quat, hand_quat) * orn_gain
+
+    dpose = np.concatenate([pos_err, orn_err])
+    damping = 0.05
+    lmbda = np.eye(6, dtype=np.float32) * (damping**2)
+    u = j_eef.T @ np.linalg.inv(j_eef @ j_eef.T + lmbda) @ dpose
+
+    new_targets = dof_pos.copy()
+    new_targets[:7] += u
+    new_targets[7] = gripper_m
+    new_targets[8] = gripper_m
+
+    device = robot._articulation_view._device
+    targets_t = torch.as_tensor(new_targets, dtype=torch.float32, device=device).unsqueeze(0)
+    robot._articulation_view.set_joint_position_targets(targets_t)
+
+
 def interpolate_xyz(step: int, schedule: list) -> tuple[tuple[float, float, float] | None, float]:
     """Interpolate Cartesian targets; None means joint-space home."""
     if step <= schedule[0][0]:
@@ -1128,16 +1220,27 @@ def log_mouse_dynamics(deformable, label: str) -> None:
         pass
 
 
+def grasp_lift_delta_for_mode(lift_mode: str) -> float:
+    if lift_mode == LIFT_MODE_ATTACHMENT:
+        return GRASP_LIFT_DELTA_ATTACHMENT_M
+    if lift_mode == LIFT_MODE_HYBRID:
+        return GRASP_LIFT_DELTA_HYBRID_M
+    return GRASP_LIFT_DELTA_FRICTION_M
+
+
 def check_grasp_success(
     initial_mouse_z: float,
     mouse_pos: tuple[float, float, float],
     hand_pos,
     hand_quat,
     gripper_m: float,
+    *,
+    lift_delta_m: float | None = None,
 ) -> bool:
     import numpy as np
 
-    lifted = mouse_pos[2] > initial_mouse_z + GRASP_LIFT_DELTA_M
+    delta_m = GRASP_LIFT_DELTA_M if lift_delta_m is None else lift_delta_m
+    lifted = mouse_pos[2] > initial_mouse_z + delta_m
     # Franka convention: 0 = closed, 0.04 = open. Pinching means gripper at clamp target.
     pinching = gripper_m <= GRIPPER_CLAMP_M * 1.2
     if lifted and pinching:
@@ -2276,6 +2379,41 @@ def update_mouse_attachment(deformable, grip_center: tuple[float, float, float])
     view.set_simulation_mesh_kinematic_targets(targets)
 
 
+def update_mouse_partial_attachment(deformable, grip_center: tuple[float, float, float]) -> None:
+    """Kinematically drive only captured grip-region nodes; tail/head remain FEM-free.
+
+    Call BEFORE ``world.step()`` (same timing as full attachment). Uses w=0 on
+    ``_grasp_attach_indices`` only; all other nodes stay w=1 so friction + elasticity
+    still act on the periphery.
+    """
+    import numpy as np
+    import torch
+
+    if _grasp_attach_indices is None or _grasp_attach_rest_pos is None or _grasp_attach_grip_center is None:
+        return
+    view = deformable._deformable_prim_view
+    if not view.is_physics_handle_valid():
+        return
+
+    nodes = view.get_simulation_mesh_nodal_positions()
+    if not torch.is_tensor(nodes):
+        nodes = torch.as_tensor(nodes, dtype=torch.float32, device=view._device)
+    if nodes.dim() == 2:
+        nodes = nodes.unsqueeze(0)
+
+    delta = np.asarray(grip_center, dtype=np.float64) - np.asarray(_grasp_attach_grip_center, dtype=np.float64)
+    targets = torch.zeros((nodes.shape[0], nodes.shape[1], 4), dtype=torch.float32, device=view._device)
+    targets[..., 3] = 1.0
+    for i in _grasp_attach_indices:
+        ti = int(i)
+        carried = _grasp_attach_rest_pos[ti] + delta
+        targets[0, ti, 0] = float(carried[0])
+        targets[0, ti, 1] = float(carried[1])
+        targets[0, ti, 2] = float(carried[2])
+        targets[0, ti, 3] = 0.0
+    view.set_simulation_mesh_kinematic_targets(targets)
+
+
 def enable_pinch_mouse_filter(stage, collision_path: str, filter_mode: str) -> None:
     """During pinch with filter=none, disable gripper↔mouse GPU contact to avoid ejection."""
     global _pinch_mouse_filter_added
@@ -2641,21 +2779,54 @@ def align_deformable_mouse_on_table(deformable, *, quiet: bool = False) -> tuple
     return float(center[0]), float(center[1]), float(center[2])
 
 
+def _bind_preview_surface(stage, prim, mat_path: str, *, color: tuple[float, float, float], roughness: float) -> None:
+    """Simple UsdPreviewSurface for demo props (render purpose)."""
+    from pxr import Gf, Sdf, UsdShade
+
+    if not stage.GetPrimAtPath(mat_path).IsValid():
+        mat = UsdShade.Material.Define(stage, mat_path)
+        shader = UsdShade.Shader.Define(stage, f"{mat_path}/PreviewSurface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
+        mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    UsdShade.MaterialBindingAPI(prim).Bind(
+        UsdShade.Material.Get(stage, mat_path),
+        materialPurpose=UsdShade.Tokens.full,
+    )
+
+
+def _define_scaled_box(stage, path, translate: tuple[float, float, float], scale: tuple[float, float, float]):
+    from pxr import Gf, UsdGeom
+
+    cube = UsdGeom.Cube.Define(stage, path)
+    cube.CreateSizeAttr(1.0)
+    xf = UsdGeom.Xformable(cube.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(*translate))
+    xf.AddScaleOp().Set(Gf.Vec3f(*scale))
+    return cube.GetPrim()
+
+
 def add_kinematic_table(stage) -> None:
-    """Static table slab — matches soft-block grasp workcell height."""
+    """Kinematic work table: same collision top as before + four legs to the ground plane."""
     from pxr import Gf, Sdf, UsdGeom, UsdPhysics, UsdShade
 
     root_path = Sdf.Path("/World/DemoTable")
     UsdGeom.Xform.Define(stage, root_path)
-    xf = UsdGeom.Xformable(stage.GetPrimAtPath(root_path))
-    xf.ClearXformOpOrder()
-    xf.AddTranslateOp().Set(Gf.Vec3d(*TABLE_TRANSLATE))
-    xf.AddScaleOp().Set(Gf.Vec3f(*TABLE_SCALE))
+    root_xf = UsdGeom.Xformable(stage.GetPrimAtPath(root_path))
+    root_xf.ClearXformOpOrder()
+    root_xf.AddTranslateOp().Set(Gf.Vec3d(TABLE_CENTER_XY[0], TABLE_CENTER_XY[1], 0.0))
 
-    cube_path = root_path.AppendChild("CollisionCube")
-    cube = UsdGeom.Cube.Define(stage, cube_path)
-    cube.CreateSizeAttr(1.0)
-    UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+    top_center_z = TABLE_TOP_Z - TABLE_TOP_THICKNESS_M * 0.5
+    top_scale = (TABLE_TOP_SIZE_XY[0], TABLE_TOP_SIZE_XY[1], TABLE_TOP_THICKNESS_M)
+    top_prim = _define_scaled_box(
+        stage,
+        str(root_path.AppendChild("Top")),
+        (0.0, 0.0, top_center_z),
+        top_scale,
+    )
+    UsdPhysics.CollisionAPI.Apply(top_prim)
 
     # Near-frictionless physics material so the first finger can slide the mouse to self-center.
     mat_path = root_path.AppendChild("SlipperyMaterial")
@@ -2664,9 +2835,40 @@ def add_kinematic_table(stage) -> None:
     phys_mat.CreateStaticFrictionAttr(0.0)
     phys_mat.CreateDynamicFrictionAttr(0.0)
     phys_mat.CreateRestitutionAttr(0.0)
-    UsdShade.MaterialBindingAPI.Apply(cube.GetPrim()).Bind(
+    UsdShade.MaterialBindingAPI.Apply(top_prim).Bind(
         mat, bindingStrength=UsdShade.Tokens.weakerThanDescendants, materialPurpose="physics"
     )
+    _bind_preview_surface(
+        stage,
+        top_prim,
+        f"{root_path}/TopWoodMaterial",
+        color=(0.58, 0.40, 0.24),
+        roughness=0.62,
+    )
+
+    leg_center_z = TABLE_LEG_HEIGHT_M * 0.5
+    leg_scale = (TABLE_LEG_SIZE_M, TABLE_LEG_SIZE_M, TABLE_LEG_HEIGHT_M)
+    leg_x = TABLE_TOP_SIZE_XY[0] * 0.5 - TABLE_LEG_INSET_M
+    leg_y = TABLE_TOP_SIZE_XY[1] * 0.5 - TABLE_LEG_INSET_M
+    for name, lx, ly in (
+        ("Leg_FL", -leg_x, -leg_y),
+        ("Leg_FR", leg_x, -leg_y),
+        ("Leg_BL", -leg_x, leg_y),
+        ("Leg_BR", leg_x, leg_y),
+    ):
+        leg_prim = _define_scaled_box(
+            stage,
+            str(root_path.AppendChild(name)),
+            (lx, ly, leg_center_z),
+            leg_scale,
+        )
+        _bind_preview_surface(
+            stage,
+            leg_prim,
+            f"{root_path}/LegWoodMaterial",
+            color=(0.44, 0.30, 0.18),
+            roughness=0.72,
+        )
 
     rb = UsdPhysics.RigidBodyAPI.Apply(stage.GetPrimAtPath(root_path))
     rb.CreateRigidBodyEnabledAttr(True)
@@ -3083,10 +3285,120 @@ def log_link_render_vs_physics(stage, link_views, label: str) -> None:
     print(f"[grasp_demo] link pose [{label}]: " + " | ".join(parts), flush=True)
 
 
+def _define_pinhole_camera(stage, path: str, *, focal_length: float = 24.0, clip_near: float = 0.02) -> None:
+    from pxr import Gf, UsdGeom
+
+    cam = UsdGeom.Camera.Define(stage, path)
+    cam.CreateFocalLengthAttr(float(focal_length))
+    cam.CreateHorizontalApertureAttr(20.955)
+    cam.CreateClippingRangeAttr(Gf.Vec2f(float(clip_near), 100.0))
+
+
+def setup_demo_cameras(stage, scene_center: tuple[float, float, float]) -> dict[str, str]:
+    """Create wrist (hand-mounted) + fixed side USD camera for the main viewport."""
+    from pxr import Gf, UsdGeom
+
+    cx, cy, _cz = scene_center
+    look_at = (float(cx), float(cy), float(TABLE_TOP_Z + 0.05))
+
+    if stage.GetPrimAtPath(HAND_LINK).IsValid():
+        _define_pinhole_camera(
+            stage, WRIST_CAM_PATH, focal_length=WRIST_CAM_FOCAL_MM, clip_near=0.02,
+        )
+        wrist_xf = UsdGeom.Xformable(stage.GetPrimAtPath(WRIST_CAM_PATH))
+        wrist_xf.ClearXformOpOrder()
+        wrist_xf.AddTranslateOp().Set(
+            Gf.Vec3d(WRIST_CAM_LOCAL_X_M, WRIST_CAM_LOCAL_Y_M, WRIST_CAM_LOCAL_Z_M),
+        )
+        rx, ry, rz = WRIST_CAM_ROT_DEG
+        wrist_xf.AddRotateXYZOp().Set(Gf.Vec3f(float(rx), float(ry), float(rz)))
+    else:
+        print(f"[grasp_demo] wrist camera skipped: {HAND_LINK} not found", flush=True)
+
+    if not stage.GetPrimAtPath(CAMERAS_ROOT).IsValid():
+        UsdGeom.Xform.Define(stage, CAMERAS_ROOT)
+    _define_pinhole_camera(stage, SIDE_CAM_PATH)
+
+    # Mouse head–tail along +Y. Main viewport = camera on +X looking −X.
+    side_eye = (cx + DEMO_CAM_SIDE_DIST_M, cy, DEMO_CAM_SIDE_HEIGHT_M)
+
+    paths = {
+        "wrist": WRIST_CAM_PATH,
+        "side": SIDE_CAM_PATH,
+        "look_at": look_at,
+        "side_eye": side_eye,
+    }
+    print(
+        f"[grasp_demo] demo cameras: wrist={WRIST_CAM_PATH} main={SIDE_CAM_PATH}",
+        flush=True,
+    )
+    return paths
+
+
+def warmup_renderer(app, steps: int = 20) -> None:
+    """Let Kit/RTX finish loading before opening extra viewport windows."""
+    for _ in range(max(0, steps)):
+        app.update()
+
+
+def configure_demo_viewports(cameras: dict[str, str], *, open_extra: bool = True) -> None:
+    """Point camera prims at the scene; optionally open a floating wrist viewport."""
+    from isaacsim.core.utils.viewports import set_camera_view
+
+    look_at = list(cameras["look_at"])
+    side_eye = list(cameras["side_eye"])
+
+    set_camera_view(eye=side_eye, target=look_at, camera_prim_path=SIDE_CAM_PATH)
+    # Main viewport → side third-person (arm + table along mouse width).
+    set_camera_view(eye=side_eye, target=look_at, camera_prim_path="/OmniverseKit_Persp")
+
+    if not open_extra:
+        print(
+            "[grasp_demo] extra viewports disabled — main view only. "
+            "Switch camera via viewport menu: wrist_cam / SideView.",
+            flush=True,
+        )
+        return
+
+    for label, key, pos in (
+        ("Grasp — Wrist", "wrist", (40, 40)),
+    ):
+        path = cameras.get(key)
+        if not path or not path.startswith("/"):
+            continue
+        try:
+            from isaacsim.core.utils.viewports import create_viewport_for_camera
+
+            create_viewport_for_camera(label, path)
+            print(f"[grasp_demo] viewport '{label}' → {path}", flush=True)
+        except Exception as exc:
+            try:
+                from omni.kit.viewport.utility import create_viewport_window
+                from pxr import Sdf
+
+                create_viewport_window(
+                    name=label,
+                    width=480,
+                    height=360,
+                    position_x=pos[0],
+                    position_y=pos[1],
+                    camera_path=Sdf.Path(path),
+                )
+                print(f"[grasp_demo] viewport '{label}' (kit window) → {path}", flush=True)
+            except Exception as exc2:
+                print(
+                    f"[grasp_demo] viewport '{label}' skipped ({exc}; {exc2}). "
+                    "Use the viewport camera menu to pick wrist_cam or SideView.",
+                    flush=True,
+                )
+
+
 def build_scene(
     app,
     mouse_usd: Path,
     *,
+    show_collision_debug: bool = False,
+    show_gripper_debug: bool = False,
     show_fem_nodes: bool = False,
     show_gripper_contacts: bool = False,
     collision_filter_mode: str = "all",
@@ -3251,33 +3563,51 @@ def build_scene(
         dome.CreateIntensityAttr(800.0)
 
     debug = MousePhysicsDebug(
-        world.stage, mesh_path, enabled=True, show_node_clouds=show_fem_nodes
+        world.stage, mesh_path, enabled=show_collision_debug, show_node_clouds=show_fem_nodes
     )
     gripper_debug = GripperBlockerDebug(
-        world.stage, collision_path, enabled=True, enable_contacts=show_gripper_contacts
+        world.stage,
+        collision_path,
+        enabled=show_gripper_debug,
+        enable_contacts=show_gripper_contacts,
     )
-    debug.ensure_prims()
+    if show_collision_debug:
+        debug.ensure_prims()
     # gripper collider debug builds after sim play (see prepare_run)
-    print(
-        "[grasp_demo] physics debug ON:\n"
-        "  white mesh  = render/visual (dimmed to ~15% opacity for debug)\n"
-        "  orange mesh = live PhysX collision tet hull (/World/DebugMouse/CollisionTetMesh)\n"
-        "  orange wire = hull surface edges (/World/DebugMouse/CollisionWire)\n"
-        "  orange box  = hull AABB (/World/DebugMouse/CollisionHullBBox) — always visible in RTX\n"
-        "  green mesh  = gripper rigid colliders (under finger/hand links as PhysXColliderDebug_*)\n"
-        + (
-            "  red points  = live PhysX contacts (/World/DebugGripper/ContactPoints)\n"
-            if show_gripper_contacts
-            else "  (contact points off — pass --show-gripper-contacts to enable)\n"
+    if show_collision_debug or show_gripper_debug:
+        print(
+            "[grasp_demo] physics debug ON:\n"
+            + (
+                "  white mesh  = render/visual (dimmed to ~15% opacity for debug)\n"
+                "  orange mesh = live PhysX collision tet hull (/World/DebugMouse/CollisionTetMesh)\n"
+                "  orange wire = hull surface edges (/World/DebugMouse/CollisionWire)\n"
+                "  orange box  = hull AABB (/World/DebugMouse/CollisionHullBBox) — always visible in RTX\n"
+                if show_collision_debug
+                else ""
+            )
+            + (
+                "  green mesh  = gripper rigid colliders (under finger/hand links as PhysXColliderDebug_*)\n"
+                if show_gripper_debug
+                else ""
+            )
+            + (
+                "  red points  = live PhysX contacts (/World/DebugGripper/ContactPoints)\n"
+                if show_gripper_contacts
+                else "  (contact points off — pass --show-gripper-contacts to enable)\n"
+            )
+            + (
+                "  cyan points = FEM sim nodes (/World/DebugMouse/SimNodes)\n"
+                "  orange pts  = collision nodes (/World/DebugMouse/CollisionNodes)"
+                if show_fem_nodes
+                else "  (SimNodes/CollisionNodes hidden — pass --show-fem-nodes to show)"
+            ),
+            flush=True,
         )
-        + (
-            "  cyan points = FEM sim nodes (/World/DebugMouse/SimNodes)\n"
-            "  orange pts  = collision nodes (/World/DebugMouse/CollisionNodes)"
-            if show_fem_nodes
-            else "  (SimNodes/CollisionNodes hidden — pass --show-fem-nodes to show)"
-        ),
-        flush=True,
-    )
+    else:
+        print(
+            "[grasp_demo] physics debug off (pass --show-collision-debug / --show-gripper-debug to enable)",
+            flush=True,
+        )
 
     return world, robot, deformable, mesh_path, debug, gripper_debug, mouse_mode, collision_path
 
@@ -3424,6 +3754,7 @@ def run_demo_sequence(
         mouse_mode=mouse_mode,
     )
     initial_mouse_z = get_mouse_world_pos(deformable, world.stage, mouse_mode=mouse_mode)[2]
+    grasp_lift_delta_m = grasp_lift_delta_for_mode(lift_mode)
     print(f"[grasp_demo] robot dofs={robot.num_dof} names={robot.dof_names}", flush=True)
     print(
         f"[grasp_demo] mouse-mode={mouse_mode}, collision-path={collision_path}, "
@@ -3456,14 +3787,16 @@ def run_demo_sequence(
     clear_pinch_mouse_filter_state()
     step = 0
     grasp_success = False
-    phase = "approach"  # approach → descend → pinch → lift → done
+    phase = "approach"  # approach → descend → pinch → hybrid_settle → lift → done
     pinch_anchor: tuple[float, float, float] | None = None
     grasp_anchor: tuple[float, float, float] | None = None
     pinch_steps = 0
     lift_steps = 0
     lift_gripper_m = GRIPPER_CLAMP_M
-    lift_start_arm_q = None
     attachment_done = False
+    hybrid_attach_ready = False
+    hybrid_attach_active = False
+    hybrid_settle_steps = 0
     pinch_arm_q = None
     pinch_hold_start: int | None = None
     pinch_hold_gripper_m = GRIPPER_CLAMP_M
@@ -3674,16 +4007,16 @@ def run_demo_sequence(
                     if pinch_mode in ("force", "compliant"):
                         restore_gripper_position_hold(robot, gripper_m)
                 if pinch_steps >= pinch_hold_start + GRIPPER_CLAMP_HOLD_STEPS:
-                    phase = "lift"
                     grasp_anchor = pinch_anchor
-                    lift_steps = 0
-                    lift_start_arm_q = (
-                        pinch_arm_q.detach().clone() if pinch_arm_q is not None else None
-                    )
-                    log_gripper_state(robot, "lift_start")
                     attachment_done = False
+                    _lift_delta_m = GRASP_LIFT_Z_OFFSET_M - GRASP_STRADDLE_Z_OFFSET_M
+                    fs = get_finger_joint_state(robot)
+                    if fs is not None:
+                        lift_gripper_m = min(fs[0], fs[1])
+                    else:
+                        lift_gripper_m = GRIPPER_CLAMP_M
                     if (
-                        lift_mode == LIFT_MODE_ATTACHMENT
+                        lift_mode == LIFT_MODE_HYBRID
                         and deformable is not None
                         and mouse_mode == "deformable"
                     ):
@@ -3694,32 +4027,66 @@ def run_demo_sequence(
                             float(hand_pos0[2]) - GRASP_TCP_OFFSET_M,
                         )
                         n = attach_mouse_to_hand(deformable, grip_center0)
-                        attachment_done = n > 0
-                        if attachment_done:
-                            update_mouse_attachment(deformable, grip_center0)
-                    elif lift_mode == LIFT_MODE_FRICTION:
-                        fs = get_finger_joint_state(robot)
-                        if fs is not None:
-                            lift_gripper_m = min(fs[0], fs[1])
-                        else:
-                            lift_gripper_m = GRIPPER_CLAMP_M
+                        hybrid_attach_ready = n > 0
+                        hybrid_attach_active = hybrid_attach_ready
+                        hybrid_settle_steps = 0
+                        phase = "hybrid_settle"
                         print(
-                            f"[grasp_demo] lift via friction (no FEM nodal attachment), "
-                            f"hold/creep from {lift_gripper_m * 1000:.1f} mm/finger",
+                            f"[grasp_demo] pinch hold complete — hybrid constraint settle "
+                            f"({HYBRID_CONSTRAINT_SETTLE_STEPS} frames, arm frozen) before "
+                            f"Cartesian lift +{_lift_delta_m * 1000:.0f} mm; "
+                            f"grip {lift_gripper_m * 1000:.1f} mm/finger",
                             flush=True,
                         )
-                    print(
-                        f"[grasp_demo] pinch hold complete at step {step} — start vertical lift from "
-                        f"({grasp_anchor[0]:.3f}, {grasp_anchor[1]:.3f}, {grasp_anchor[2]:.3f})",
-                        flush=True,
-                    )
+                    else:
+                        phase = "lift"
+                        lift_steps = 0
+                        log_gripper_state(robot, "lift_start")
+                        if (
+                            lift_mode == LIFT_MODE_ATTACHMENT
+                            and deformable is not None
+                            and mouse_mode == "deformable"
+                        ):
+                            hand_pos0, _ = get_hand_world_pose(hand_view)
+                            grip_center0 = (
+                                float(hand_pos0[0]),
+                                float(hand_pos0[1]),
+                                float(hand_pos0[2]) - GRASP_TCP_OFFSET_M,
+                            )
+                            n = attach_mouse_to_hand(deformable, grip_center0)
+                            attachment_done = n > 0
+                            if attachment_done:
+                                update_mouse_attachment(deformable, grip_center0)
+                        elif lift_mode == LIFT_MODE_FRICTION:
+                            print(
+                                f"[grasp_demo] lift via friction: Cartesian IK +{_lift_delta_m * 1000:.0f} mm, "
+                                f"hold/creep from {lift_gripper_m * 1000:.1f} mm/finger",
+                                flush=True,
+                            )
+                        print(
+                            f"[grasp_demo] pinch hold complete at step {step} — start vertical lift from "
+                            f"({grasp_anchor[0]:.3f}, {grasp_anchor[1]:.3f}, {grasp_anchor[2]:.3f})",
+                            flush=True,
+                        )
+        elif phase == "hybrid_settle":
+            hybrid_settle_steps += 1
+            gripper_m = lift_gripper_m
+            if hybrid_settle_steps >= HYBRID_CONSTRAINT_SETTLE_STEPS:
+                phase = "lift"
+                lift_steps = 0
+                log_gripper_state(robot, "lift_start")
+                print(
+                    f"[grasp_demo] hybrid constraint settle done — start vertical lift from "
+                    f"({grasp_anchor[0]:.3f}, {grasp_anchor[1]:.3f}, {grasp_anchor[2]:.3f})",
+                    flush=True,
+                )
         else:  # lift
             assert grasp_anchor is not None
             lift_steps += 1
             t = min(1.0, lift_steps / max(1, LIFT_DURATION_STEPS))
             lift_delta = GRASP_LIFT_Z_OFFSET_M - GRASP_STRADDLE_Z_OFFSET_M
             target_xyz = (grasp_anchor[0], grasp_anchor[1], grasp_anchor[2] + lift_delta * t)
-            if lift_mode == LIFT_MODE_FRICTION:
+            if lift_mode in (LIFT_MODE_FRICTION, LIFT_MODE_HYBRID):
                 if lift_gripper_m > FRICTION_LIFT_GRIP_MIN_M:
                     lift_gripper_m = max(FRICTION_LIFT_GRIP_MIN_M, lift_gripper_m - FRICTION_LIFT_GRIP_CREEP_M)
                 gripper_m = lift_gripper_m
@@ -3729,24 +4096,23 @@ def run_demo_sequence(
             if lift_steps >= LIFT_DURATION_STEPS:
                 phase = "done"
 
-        if phase == "pinch" and pinch_arm_q is not None:
-            if pinch_mode == "force":
+        if phase in ("pinch", "hybrid_settle") and pinch_arm_q is not None:
+            if phase == "pinch" and pinch_mode == "force":
                 apply_frozen_arm_only(robot, pinch_arm_q)
                 apply_gripper_closing_effort(robot, sign=close_effort_sign)
-            elif pinch_mode == "compliant":
+            elif phase == "pinch" and pinch_mode == "compliant":
                 apply_frozen_arm_gripper(robot, pinch_arm_q, gripper_m)
             else:
                 apply_frozen_arm_gripper(
-                    robot, pinch_arm_q, gripper_m, soft_close=force_grip
+                    robot, pinch_arm_q, gripper_m, soft_close=force_grip if phase == "pinch" else False
                 )
-        elif phase == "lift" and lift_mode == LIFT_MODE_FRICTION and lift_start_arm_q is not None:
-            t = min(1.0, lift_steps / max(1, LIFT_DURATION_STEPS))
-            apply_joint_lift_step(robot, lift_start_arm_q, t, gripper_m)
-            force_gripper_spacing(robot, gripper_m)
+        elif phase == "lift":
+            assert grasp_anchor is not None
+            apply_vertical_cartesian_lift_step(
+                robot, hand_view, target_xyz[2], grasp_anchor[:2], gripper_m
+            )
         else:
             apply_cartesian_ik_step(robot, hand_view, target_xyz, gripper_m)
-            if phase == "lift" and lift_mode == LIFT_MODE_FRICTION:
-                force_gripper_spacing(robot, gripper_m)
 
         if deformable is not None:
             if phase in ("approach", "descend"):
@@ -3824,14 +4190,17 @@ def run_demo_sequence(
         # Carry the mouse BEFORE world.step() so the solver sees kinematic targets
         # for THIS step. GUI mode runs world.step(render=True) which syncs Fabric
         # at the end — a post-step write gets overridden by gravity next frame.
-        if phase == "lift" and attachment_done and deformable is not None:
+        if phase in ("hybrid_settle", "lift") and deformable is not None:
             hand_pos_l, _ = get_hand_world_pose(hand_view)
             grip_center = (
                 float(hand_pos_l[0]),
                 float(hand_pos_l[1]),
                 float(hand_pos_l[2]) - GRASP_TCP_OFFSET_M,
             )
-            update_mouse_attachment(deformable, grip_center)
+            if phase == "lift" and attachment_done:
+                update_mouse_attachment(deformable, grip_center)
+            elif hybrid_attach_active and hybrid_attach_ready:
+                update_mouse_partial_attachment(deformable, grip_center)
 
         world.step(render=not headless)
 
@@ -3841,7 +4210,7 @@ def run_demo_sequence(
         if gripper_debug is not None and not headless:
             gripper_debug.update(robot)
 
-        if phase in ("pinch", "lift") and step % 15 == 0:
+        if phase in ("pinch", "hybrid_settle", "lift") and step % 15 == 0:
             log_link_render_vs_physics(world.stage, link_views, f"{phase} s{step}")
             log_mouse_dynamics(deformable, f"{phase} s{step}")
 
@@ -3850,9 +4219,11 @@ def run_demo_sequence(
         if phase == "lift" and step >= GRASP_CHECK_START:
             mouse_pos = get_mouse_world_pos(deformable, world.stage, mouse_mode=mouse_mode)
             hand_pos, hand_quat = get_hand_world_pose(hand_view)
-            if check_grasp_success(initial_mouse_z, mouse_pos, hand_pos, hand_quat, gripper_m):
+            if check_grasp_success(
+                initial_mouse_z, mouse_pos, hand_pos, hand_quat, gripper_m, lift_delta_m=grasp_lift_delta_m
+            ):
                 grasp_success = True
-                lifted = mouse_pos[2] > initial_mouse_z + GRASP_LIFT_DELTA_M
+                lifted = mouse_pos[2] > initial_mouse_z + grasp_lift_delta_m
                 mode = "mouse lifted" if lifted else "top-down pinch"
                 print(
                     f"[grasp_demo] grasp confirmed at step {step} ({mode}): mouse z={mouse_pos[2]:.3f} "
@@ -4013,6 +4384,8 @@ def main() -> int:
         world, robot, deformable, mesh_path, debug, gripper_debug, mouse_mode, collision_path = build_scene(
             simulation_app,
             args.mouse_usd,
+            show_collision_debug=args.show_collision_debug,
+            show_gripper_debug=args.show_gripper_debug,
             show_fem_nodes=args.show_fem_nodes,
             show_gripper_contacts=args.show_gripper_contacts,
             collision_filter_mode=args.collision_filter,
@@ -4025,11 +4398,6 @@ def main() -> int:
             mouse_friction=args.mouse_friction,
             gripper_friction=args.gripper_friction,
         )
-        if args.hide_collision_debug:
-            debug.enabled = False
-        if args.hide_gripper_debug:
-            gripper_debug.enabled = False
-
         if args.push_test and deformable is not None:
             # prepare_run does world.reset + play + deformable.initialize + settle on table
             prepare_run(
@@ -4040,7 +4408,13 @@ def main() -> int:
             simulation_app.close()
             return exit_code
 
-        if not args.headless:
+        if not args.headless and not args.no_demo_cameras:
+            scene_center = read_mouse_mesh_center(world.stage, mesh_path)
+            demo_cams = setup_demo_cameras(world.stage, scene_center)
+            if not args.no_extra_viewports:
+                warmup_renderer(simulation_app, 20)
+            configure_demo_viewports(demo_cams, open_extra=not args.no_extra_viewports)
+        elif not args.headless:
             from isaacsim.core.utils.viewports import set_camera_view
 
             set_camera_view(

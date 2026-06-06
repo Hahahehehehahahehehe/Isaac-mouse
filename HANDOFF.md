@@ -13,11 +13,14 @@ Isaac Sim **5.1** 里用 **PhysX FEM 软体小鼠** + **Factory Franka 平行夹
 ```powershell
 $py = "D:\Labworks\Project_Issac\.venv-isaacsim\Scripts\python.exe"
 
-# 默认：摩擦 lift
-& $py scripts\grasp_demo.py --hide-collision-debug --hide-gripper-debug --no-export
+# GUI（默认无 debug 叠加层）
+& $py scripts\grasp_demo.py --lift-mode hybrid --no-export
+
+# 摩擦 lift（默认 --lift-mode）
+& $py scripts\grasp_demo.py --no-export
 
 # 旧方案：FEM 节点刚性搬运
-& $py scripts\grasp_demo.py --lift-mode attachment --hide-collision-debug --hide-gripper-debug --no-export
+& $py scripts\grasp_demo.py --lift-mode attachment --no-export
 
 & $py scripts\grasp_demo.py --headless --no-export
 ```
@@ -44,9 +47,10 @@ $py = "D:\Labworks\Project_Issac\.venv-isaacsim\Scripts\python.exe"
 
 - **GUI**：可夹起小鼠并抬离桌面，达到预期；一段时间后可能从指间滑脱。
 - **机制**：`DEFORMABLE_FRICTION` + `GRIPPER_FRICTION`（当前 μ=6.0）；lift 不用 `attach_mouse_to_hand`。
-- **抬升**：`apply_joint_lift_step` 从 pinch 关节姿态插值到 `ARM_LIFT_DEG`；`LIFT_DURATION_STEPS=360`（~6 s）。
-- **判定**：FEM 质心 Δz ≥ **12 mm** → `grasp confirmed`（头下沉时质心低于手指高度）。
+- **抬升**：`apply_cartesian_ik_step` 垂直抬升（`GRASP_LIFT_Z_OFFSET_M`，+12 cm）；`LIFT_DURATION_STEPS=360`（~6 s）。摩擦/hybrid 仍保留指间 creep。
+- **判定**：FEM 质心 Δz ≥ **12 cm** → `grasp confirmed`（与 Cartesian lift 跨度一致）。
 - **Pinch 二次发力**：60 帧闭合爬坡 → 45 帧 `squeeze`（`force_grip=True`）→ 120 帧 hold，GUI 可见接触后再次收紧。
+- **Hybrid 约束时序**：pinch hold 结束 → **30 帧 `hybrid_settle`**（手臂冻结 + 局部 kinematic 约束）→ 再开始 Cartesian 抬升（避免先滑后拽）。
 
 ### B. 遗留 / 次要
 
@@ -81,11 +85,8 @@ DEFORMABLE_FRICTION          = 6.0
 GRIPPER_FRICTION             = 6.0
 DEFAULT_FINGER_MAX_FORCE_N   = 180.0
 LIFT_DURATION_STEPS          = 360   # ~6 s；速度 ∝ 1/steps
-GRASP_LIFT_DELTA_FRICTION_M  = 0.012 # 12 mm 质心抬升 → confirmed
+GRASP_LIFT_DELTA_CONFIRM_M   = 0.12  # 12 cm 质心抬升 → confirmed（各 lift 模式统一）
 DEFAULT_LIFT_MODE            = friction
-
-# 旧 attachment
-GRASP_LIFT_DELTA_ATTACHMENT_M = 0.045
 
 # 通用
 DEFAULT_DEFORM_CONTACT_OFFSET = 0.002
@@ -107,8 +108,8 @@ MAX_GRASP_STEPS = STEPS_DESCEND + _PINCH_MAX_STEPS + LIFT_DURATION_STEPS + 80
 
 ```
 prepare_run → approach → descend → pinch (close → squeeze → hold)
-    → lift (friction: 关节插值 + 指间 creep；或 attachment: 整网平移)
-    → grasp confirmed（摩擦：质心 Δz≥12 mm；attachment：Δz≥45 mm）
+    → lift (friction/hybrid: Cartesian IK + 指间 creep；attachment: Cartesian + 整网平移)
+    → grasp confirmed（质心 Δz ≥ 12 cm）
 ```
 
 ---
